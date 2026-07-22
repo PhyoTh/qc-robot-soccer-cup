@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Keep trained models and inference artifacts out of this driver repository.
+*.eim
+*.tflite
+*.onnx
+*.pt
+*.pth
+*.h5
+*.keras
+*.pb
+*.engine
+*.safetensors
