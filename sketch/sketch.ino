@@ -51,6 +51,7 @@ const char MOTOR_BOARD_CONNECTOR[4][3] = {"M3", "M2", "M1", "M4"};
 
 const uint8_t ULTRASONIC_I2C_ADDR = 0x77;
 const uint8_t LINE_FOLLOWER_I2C_ADDR = 0x78;
+const uint8_t CAM_BUTTON_I2C_ADDR = 0x79;
 const uint8_t ULTRASONIC_RGB_MODE = 2;
 const uint8_t ULTRASONIC_RGB1_R = 3;
 const uint8_t ULTRASONIC_RGB_SIMPLE_MODE = 0;
@@ -59,6 +60,12 @@ unsigned long driveStopAt = 0;
 bool driveTimerActive = false;
 uint8_t speedPercent = 55;
 bool obstacleAvoidEnabled = false;
+bool programEnabled = false;
+bool programEnablePending = false;
+int lastCamHoldState = -1;
+unsigned long lastIdleFlashAt = 0;
+bool idleFlashState = false;
+unsigned long lastButtonActionAt = 0;
 unsigned long lastAvoidUpdate = 0;
 String commandBuffer;
 unsigned long lastCommandByteAt = 0;
@@ -142,6 +149,14 @@ bool readLineBits(uint8_t bits[4]) {
   bits[1] = (data >> 1) & 0x01;
   bits[2] = (data >> 2) & 0x01;
   bits[3] = (data >> 3) & 0x01;
+  return true;
+}
+
+bool readCamButtonState(int *pressCountOut, int *holdStateOut) {
+  Wire.requestFrom(CAM_BUTTON_I2C_ADDR, (uint8_t)2);
+  if (Wire.available() < 2) { return false; }
+  *pressCountOut = (int)Wire.read();
+  *holdStateOut  = (int)Wire.read();
   return true;
 }
 
@@ -440,6 +455,10 @@ String readSensorsJson() {
   json += distanceCm;
   json += ",\"battery_mv\":";
   json += batteryMv;
+  json += ",\"program_enabled\":";
+  json += programEnabled ? "true" : "false";
+  json += ",\"hold_toggle\":";
+  json += (lastCamHoldState > 0) ? "true" : "false";
   json += "}";
   return json;
 }
@@ -453,6 +472,7 @@ bool rpcDrive(String command, int speed, int durationMs) {
 bool rpcStop() {
   stopMotors();
   obstacleAvoidEnabled = false;
+  setProgramEnabled(false);
   return true;
 }
 
@@ -1010,6 +1030,69 @@ void pollSerial() {
   }
 }
 
+
+void setProgramEnabled(bool enabled) {
+  programEnablePending = false;
+  programEnabled = enabled;
+  obstacleAvoidEnabled = false;
+  stopMotors();
+  if (enabled) {
+    setUltrasonicColor(0, 255, 0);  // solid green while running
+  } else {
+    setUltrasonicColor(0, 0, 0);
+  }
+}
+
+void beginProgramEnableCountdown() {
+  stopMotors();
+  setUltrasonicColor(255, 0, 0);   // red
+  delay(600);
+  setUltrasonicColor(255, 180, 0); // yellow
+  delay(600);
+  setProgramEnabled(true);          // green solid — program is now live
+  CMD_IO.println(F("OK program on"));
+}
+
+void updateIdleFlash() {
+  if (programEnabled) { return; }
+  unsigned long now = millis();
+  if (now - lastIdleFlashAt >= 1500) {
+    lastIdleFlashAt = now;
+    idleFlashState = !idleFlashState;
+    setUltrasonicColor(0, 0, idleFlashState ? 255 : 0);
+  }
+}
+
+void updateStartButton() {
+  int camButtonCount = 0;
+  int camHoldState   = 0;
+  if (!readCamButtonState(&camButtonCount, &camHoldState)) { return; }
+
+  // Hold-toggle: update RGB team colour whenever it changes
+  if (lastCamHoldState < 0) {
+    lastCamHoldState = camHoldState;
+    setRgb(lastCamHoldState ? 0 : 255, 0, lastCamHoldState ? 255 : 0);
+  } else if (camHoldState != lastCamHoldState) {
+    lastCamHoldState = camHoldState;
+    setRgb(lastCamHoldState ? 0 : 255, 0, lastCamHoldState ? 255 : 0);
+    CMD_IO.println(lastCamHoldState ? F("OK hold toggle on") : F("OK hold toggle off"));
+  }
+
+  // Short press with 1s cooldown
+  if (camButtonCount == 0) { return; }
+  if ((millis() - lastButtonActionAt) < 1000UL) { return; }
+  lastButtonActionAt = millis();
+
+  CMD_IO.println(F("BOOT button pressed"));
+
+  if (programEnabled) {
+    setProgramEnabled(false);
+    CMD_IO.println(F("OK program off"));
+  } else {
+    beginProgramEnableCountdown();
+  }
+}
+
 void updateDriveTimer() {
   if (driveTimerActive && (long)(millis() - driveStopAt) >= 0) {
     stopMotors();
@@ -1065,6 +1148,8 @@ void setup() {
 
 void loop() {
   pollSerial();
+  updateStartButton();
   updateDriveTimer();
   updateObstacleAvoid();
+  updateIdleFlash();
 }

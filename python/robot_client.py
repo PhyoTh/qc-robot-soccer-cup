@@ -74,3 +74,4 @@ class MiniAutoRobot:
         finally:
             self.stop()
             print(f"[INFO] hold_toggle landed on: {'blue' if self.hold_toggle() else 'red'}")
+            self._session_active = False
