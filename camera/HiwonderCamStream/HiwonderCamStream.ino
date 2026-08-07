@@ -21,8 +21,8 @@
 // ------------------------------------------------------------
 // *** CHANGE THIS FOR EACH ROBOT ***
 // ------------------------------------------------------------
-#define CAMERA_SSID  "miniAuto_CAM_019"
-#define CAMERA_PASS  "Q19pass!"
+#define CAMERA_SSID  "miniAuto_CAM_01"
+#define CAMERA_PASS  "Q01pass!"
 // ------------------------------------------------------------
 
 #define AP_IP        "192.168.5.1"
