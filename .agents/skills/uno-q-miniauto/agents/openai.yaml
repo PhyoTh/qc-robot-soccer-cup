@@ -1,0 +1,4 @@
+interface:
+  display_name: "UNO Q miniAuto"
+  short_description: "Build custom UNO Q miniAuto robots"
+  default_prompt: "Use $uno-q-miniauto to build my own Hiwonder miniAuto behavior on the UNO Q."

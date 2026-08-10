@@ -12,6 +12,10 @@ For questions or concerns, please create GitHub Issues.
   - [Contents](#contents)
   - [System overview](#system-overview)
   - [Repository layout](#repository-layout)
+  - [Using the `uno-q-miniauto` agent skill](#using-the-uno-q-miniauto-agent-skill)
+    - [What the skill can build](#what-the-skill-can-build)
+    - [How to use it](#how-to-use-it)
+    - [Safe validation workflow](#safe-validation-workflow)
   - [Hardware map](#hardware-map)
     - [Pin Mapping](#pin-mapping)
   - [UNO Q robot setup](#uno-q-robot-setup)
@@ -51,6 +55,9 @@ The Linux side of the UNO Q runs `python/main.py`, which uses `python/robot_clie
 
 ```text
 .
+├── .agents/
+│   └── skills/
+│       └── uno-q-miniauto/          # Repo-local agent workflow for extending this robot
 ├── app.yaml                         # UNO Q App Lab application metadata
 ├── camera/
 │   └── HiwonderCamStream.ino        # ESP32-S3 GC2145 camera firmware
@@ -61,6 +68,74 @@ The Linux side of the UNO Q runs `python/main.py`, which uses `python/robot_clie
     ├── sketch.ino                   # Complete UNO Q miniAuto hardware driver
     └── sketch.yaml                  # Zephyr platform and Bridge dependency
 ```
+
+## Using the `uno-q-miniauto` agent skill
+
+This repository includes a reusable agent skill at `.agents/skills/uno-q-miniauto`. Your AI agent can use it to turn a robot idea into focused changes across the existing UNO Q firmware, Python Bridge application, camera firmware, configuration, and documentation while preserving the driver's safety behavior and public interfaces.
+
+### What the skill can build
+
+| Goal | Typical result |
+| --- | --- |
+| Create autonomous or soccer behavior | Add sensor-driven routines, navigation policies, team behavior, or match logic on the UNO Q Linux/Python side. |
+| Integrate vision or an ML model | Connect an externally supplied model to camera frames and translate detections into bounded robot actions. Model binaries remain outside this driver repository. |
+| Add a sensor or actuator | Add bounded MCU I/O, safe failure handling, sensor payload fields, actuator commands, and Python wrapper methods. |
+| Extend the Bridge API | Add matching `Bridge.provide_safe(...)` firmware providers and typed `MiniAutoRobot` methods without breaking the existing contract. |
+| Tune or add motion | Adjust motor mapping, polarity, mecanum mixing, named movements, speed limits, and timed-stop behavior. |
+| Customize the camera | Change the ESP32-S3 access point, MJPEG stream, button behavior, or GC2145 configuration. |
+| Adapt a hardware revision | Update verified pins, I2C addresses, wiring documentation, diagnostics, and initialization for a different miniAuto build. |
+| Improve setup and distribution | Update App Lab metadata, Arduino dependencies, public API documentation, examples, and first-run instructions. |
+
+The skill extends the checked-out source rather than generating a separate driver stack. It chooses the smallest appropriate layer: high-level behavior normally stays in Python, direct hardware control and fail-safe timing stay in the UNO Q sketch, and camera-only changes stay in the ESP32-S3 firmware.
+
+### How to use it
+
+Open this repository in your platform of choice, for example `Codex`, then explicitly invoke the skill with `$uno-q-miniauto` and describe the outcome you want. Include known hardware details, constraints, and desired stop behavior when they matter.
+
+Example prompts:
+
+```text
+Use $uno-q-miniauto to make the robot follow a line until the ultrasonic
+sensor sees an obstacle within 30 cm, then stop safely.
+```
+
+```text
+Use $uno-q-miniauto to add a ball-contact sensor on a verified free pin,
+expose its state to Python, and document the wiring and payload field.
+```
+
+```text
+Use $uno-q-miniauto to consume my externally supplied object-detection
+model, track a soccer ball from the camera stream, and stop on stale frames.
+```
+
+```text
+Use $uno-q-miniauto to add a timed kick actuator. Preserve the existing
+Bridge API and make program disable, sensor failure, and exceptions stop it.
+```
+
+A useful request states:
+
+- the behavior the robot should exhibit;
+- which sensors, actuators, camera, or model are involved;
+- verified pins, addresses, voltage levels, or wiring when adding hardware;
+- timing, speed, range, or accuracy constraints; and
+- what must make the robot stop or fail safely.
+
+The agent will inspect the live repository, preserve unrelated changes, map the request to the correct layer, update all affected Bridge contract points together, and report which software and physical behaviors were actually verified.
+
+### Safe validation workflow
+
+The skill starts with checks that do not operate hardware:
+
+```bash
+python3 -m py_compile python/*.py
+python3 .agents/skills/uno-q-miniauto/scripts/check_robot_contract.py --strict
+```
+
+The bundled contract checker verifies that the baseline firmware providers still exist, every Python Bridge call has a matching provider, the Python source parses, and the UNO Q Zephyr/Router Bridge configuration remains present.
+
+After static checks, compile only the affected firmware with its required toolchain. Hardware tests should begin with the wheels raised, low power or speed, short timed actions, and a reachable physical disconnect. Test one motor or actuator at a time before combined or autonomous motion. The skill does not treat static analysis or successful compilation as proof that physical behavior works, and it will not flash or move a live robot unless hardware execution is explicitly requested and a safe setup is confirmed.
 
 ## Hardware map
 
