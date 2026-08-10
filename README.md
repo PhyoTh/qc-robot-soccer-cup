@@ -419,9 +419,159 @@ Camera pin definitions:
 
 The XCLK frequency is `15 MHz`. These values come from Hiwonder's `camera_setting.h` for the `CAMERA_MODEL_ESP32S3_EYE` mapping used by the source firmware.
 
-## Model Import
 
-[TK]
+## Wall / Field-Side Detection
+
+The soccer field has coloured tape strips on the walls — **red tape** on one side, **blue tape** on the other. Your robot can use the camera stream to detect which wall it is currently facing and determine whether it is on its own side or the opponent's side.
+
+This is a good challenge to implement using HSV colour classification — no ML model or training data required.
+
+### Concept
+
+HSV (Hue, Saturation, Value) colour space makes it straightforward to isolate a specific colour regardless of brightness. The approach:
+
+1. Grab a frame from the MJPEG camera stream using OpenCV.
+2. Convert the BGR frame to HSV with cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).
+3. Create a mask for red pixels and a mask for blue pixels using cv2.inRange with calibrated hue/saturation/value bounds.
+4. Count the masked pixels for each colour and express them as a fraction of the total frame.
+5. If either colour exceeds a minimum coverage threshold (a good starting point is ~2 % of the frame), report it as the dominant side.
+6. Compare the detected wall colour against the robot's active team (from obot.hold_toggle()) to determine OWN SIDE or OPPONENT SIDE.
+
+### HSV ranges for the field tape
+
+OpenCV uses Hue 0-179, Saturation 0-255, Value 0-255. Red wraps around 0/180 in HSV so it needs two ranges:
+
+| Colour | Hue range | Notes |
+| --- | --- | --- |
+| Red | 0-10 and 160-179 | Two inRange masks combined with itwise_or |
+| Blue | 100-130 | Single inRange mask |
+
+Start with saturation >= 120 and value >= 70 to filter out dark or washed-out pixels. Adjust based on your lighting conditions.
+
+### Camera stream
+
+The ESP32-S3 camera serves an MJPEG stream at:
+
+```
+http://192.168.5.1:81/stream
+```
+
+Open it with cv2.VideoCapture(url). The stream needs a short warmup — discard frames in a loop until a non-empty frame arrives before running detection.
+
+### Suggested module layout
+
+Keep camera setup (URL, VideoCapture, warmup) in main.py and pass the open capture object into a dedicated detector class or function. This keeps colour logic reusable and testable independently of the robot loop.
+
+### Expected console output
+
+A well-implemented detector should print something like this each loop iteration:
+
+```
+[FIELD] team=RED  wall=RED   -> OWN SIDE
+[FIELD] team=RED  wall=BLUE  -> OPPONENT SIDE
+[FIELD] team=RED  wall=UNKNOWN -> UNKNOWN
+```
+
+Adding a per-frame diagnostic line showing raw red/blue coverage percentages is useful for tuning thresholds:
+
+```
+[WallDetector] red=5.22%  blue=0.01%  side=RED
+```
+
+### Tuning tips
+
+- If the detector reports UNKNOWN when tape is clearly visible, lower the minimum coverage threshold or widen the hue range.
+- If it false-positives on robot jerseys or the floor, raise the saturation minimum or narrow the hue range.
+- The black textured wall can register as very dark blue — raising the value minimum (e.g. >= 70) helps exclude it.
+- Print coverage percentages for a few seconds at startup to calibrate thresholds for your specific lighting.
+## Model Import
+<div style="display: flex; gap: 10px;">
+  <img src="docs/assets/edge-impulse/1-upload-data.png" width="45%">
+</div>
+
+### 1. Find Captured Images
+
+Create or open an Edge Impulse project and find the uploaded  images from the `captures/` folder.
+
+Example starter dataset:
+
+| Class | Example image count |
+|---|---:|
+| `soccerball` | 50 |
+| `robot` | 50 |
+| `empty`  | 50 |
+
+These counts are a small demonstration baseline, not a fixed requirement. Add more images if the model misses objects or performs poorly in new scenes.
+
+
+### 2. Label Bounding Boxes
+<div style="display: flex; gap: 10px;">
+  <img src="docs/assets/edge-impulse/2-labeling.png" width="45%">
+  <img src="docs/assets/edge-impulse/3-labeling-empty.png" width="45%">
+</div>
+
+For object detection training:
+
+- Label `soccerball` objects with bounding boxes.
+- Label `robot` objects with bounding boxes.
+- Leave `empty` / background images without bounding boxes.
+
+Keep bounding boxes tight around the visible object. Consistent labeling usually improves FOMO training results.
+
+### 3. Configure the FOMO Impulse
+<div style="display: flex; gap: 10px;">
+  <img src="docs/assets/edge-impulse/4-create-impulse.png" width="45%">
+</div>
+
+#### Input Block
+
+- Image size: **96 × 96**
+- Color depth: **RGB**
+- Resize mode: default fit-to-input behavior
+
+#### Input Block
+
+- Add image (will give you error without this)
+
+#### Learning Block
+
+- Model: **FOMO MobileNetV2 0.35**
+- Data augmentation: optimized data augmentation
+- Training cycles: **150-180** as a starting range
+- Learning rate: **0.001**
+
+Adjust these settings if your dataset, target runtime, or accuracy requirements differ.
+
+### 4. Train and Evaluate the Model
+<div style="display: flex; gap: 10px;">
+  <img src="docs/assets/edge-impulse/5-training.png" width="45%">
+</div>
+
+After training, review the validation metrics and class behavior.
+
+### 5. Export the Trained Model
+<div style="display: flex; gap: 10px;">
+  <img src="docs/assets/edge-impulse/7-FOMO-MobileNet.png" width="100%">
+</div>
+After the model performs well enough for live testing, export it as an Edge Impulse `.eim` file for Linux aarch64 if that is the runtime used by your App Lab environment.
+
+The `.eim` file is generated from your own Edge Impulse project and is not included by default.
+
+Recommended model placement:
+
+```text
+models/
+  your-model-linux-aarch64.eim
+```
+
+Or, if using the App Lab inference project directly:
+
+```text
+python/
+  main.py
+  your-model-linux-aarch64.eim
+```
+
 
 ## Safety and troubleshooting
 
@@ -458,3 +608,5 @@ Always begin with wheels raised, use short timed commands, and keep a physical p
 ### Stream is slow or choppy
 
 This can be expected: the GC2145 supplies RGB565 frames and the ESP32-S3 converts every frame to JPEG in software. Stay close to the camera access point, disconnect unused clients, and keep the default QVGA frame size while diagnosing performance.
+
+
