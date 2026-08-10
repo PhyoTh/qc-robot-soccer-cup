@@ -34,6 +34,25 @@ For questions or concerns, please create GitHub Issues.
     - [Configure and flash a camera](#configure-and-flash-a-camera)
     - [Test the stream](#test-the-stream)
     - [Camera configuration](#camera-configuration)
+  - [Wall / Field-Side Detection](#wall--field-side-detection)
+    - [Concept](#concept)
+    - [HSV ranges for the field tape](#hsv-ranges-for-the-field-tape)
+    - [Camera stream](#camera-stream)
+    - [Suggested module layout](#suggested-module-layout)
+    - [Expected console output](#expected-console-output)
+    - [Tuning tips](#tuning-tips)
+  - [Model Import](#model-import)
+    - [1. Find Captured Images](#1-find-captured-images)
+    - [2. Label Bounding Boxes](#2-label-bounding-boxes)
+    - [3. Configure the FOMO Impulse](#3-configure-the-fomo-impulse)
+    - [4. Train and Evaluate the Model](#4-train-and-evaluate-the-model)
+    - [5. Export the Trained Model](#5-export-the-trained-model)
+  - [Safety and troubleshooting](#safety-and-troubleshooting)
+    - [Robot safety behavior](#robot-safety-behavior)
+    - [Robot does not respond to Python](#robot-does-not-respond-to-python)
+    - [Camera initialization fails](#camera-initialization-fails)
+    - [Camera serial port is missing](#camera-serial-port-is-missing)
+    - [Stream is slow or choppy](#stream-is-slow-or-choppy)
   - [Model Import](#model-import)
   - [Safety and troubleshooting](#safety-and-troubleshooting)
     - [Robot safety behavior](#robot-safety-behavior)
@@ -435,7 +454,8 @@ HSV (Hue, Saturation, Value) colour space makes it straightforward to isolate a 
 3. Create a mask for red pixels and a mask for blue pixels using cv2.inRange with calibrated hue/saturation/value bounds.
 4. Count the masked pixels for each colour and express them as a fraction of the total frame.
 5. If either colour exceeds a minimum coverage threshold (a good starting point is ~2 % of the frame), report it as the dominant side.
-6. Compare the detected wall colour against the robot's active team (from obot.hold_toggle()) to determine OWN SIDE or OPPONENT SIDE.
+6. Compare the detected wall colour against the robot's active team (from 
+obot.hold_toggle()) to determine OWN SIDE or OPPONENT SIDE.
 
 ### HSV ranges for the field tape
 
