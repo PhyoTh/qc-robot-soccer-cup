@@ -3,11 +3,3 @@ description: Hiwonder miniAuto UNO Q App Lab project for simple Bridge-driven ro
 ports: []
 bricks: []
 icon: "\U0001F697"
-
-# Python entry points
-#   python/main.py            - full soccer loop (FOMO + HSV + drive logic)
-#   python/test_inference.py  - diagnostic only: camera + FOMO + HSV, no movement
-#
-# To run the diagnostic in App Lab, change the "main script" field in the
-# project settings to python/test_inference.py, then start the application.
-# Switch back to python/main.py for the live game.
