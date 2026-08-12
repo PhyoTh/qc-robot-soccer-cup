@@ -505,9 +505,6 @@ Adding a per-frame diagnostic line showing raw red/blue coverage percentages is 
 - The black textured wall can register as very dark blue — raising the value minimum (e.g. >= 70) helps exclude it.
 - Print coverage percentages for a few seconds at startup to calibrate thresholds for your specific lighting.
 ## Model Import
-<div style="display: flex; gap: 10px;">
-  <img src="docs/assets/edge-impulse/1-upload-data.png" width="45%">
-</div>
 
 ### 1. Find Captured Images
 
@@ -520,8 +517,8 @@ Create an Edge Impulse project or clone [our project with prelabelled capture da
 
 ### 2. Label Bounding Boxes
 <div style="display: flex; gap: 10px;">
-  <img src="docs/assets/edge-impulse/2-labeling.png" width="45%">
-  <img src="docs/assets/edge-impulse/3-labeling-empty.png" width="45%">
+  <img src="docs/assets/edge-impulse/2-labeling.png" width="40%">
+  <img src="docs/assets/edge-impulse/3-labeling-empty.png" width="40%">
 </div>
 
 For object detection training:
@@ -569,7 +566,7 @@ After training, review the validation metrics and class behavior.
 
 ### 5. Object Detection: Neural Network Settings
 <div style="display: flex; gap: 10px;">
-  <img src="docs/assets/edge-impulse/5-neural-network.png" width="100%">
+  <img src="docs/assets/edge-impulse/5-neural-network.png" width="80%">
 </div>
 
 #### Training Settings
@@ -590,7 +587,7 @@ models/
 
 ### 6. Deployment
 <div style="display: flex; gap: 10px;">
-  <img src="docs/assets/edge-impulse/6-deployment.png" width="100%">
+  <img src="docs/assets/edge-impulse/6-deployment.png" width="80%">
 </div>
 
 #### Configure your deployment
