@@ -511,17 +511,11 @@ Adding a per-frame diagnostic line showing raw red/blue coverage percentages is 
 
 ### 1. Find Captured Images
 
-Create or open an Edge Impulse project and find the uploaded  images from the `captures/` folder.
+Create an Edge Impulse project or clone [our project with prelabelled capture data](https://studio.edgeimpulse.com/public/1085406/live).
 
-Example starter dataset:
-
-| Class | Example image count |
-|---|---:|
-| `soccerball` | 50 |
-| `robot` | 50 |
-| `empty`  | 50 |
-
-These counts are a small demonstration baseline, not a fixed requirement. Add more images if the model misses objects or performs poorly in new scenes.
+<div style="display: flex; gap: 10px;">
+  <img src="docs/assets/edge-impulse/1-dashboard.png" width="80%">
+</div>
 
 
 ### 2. Label Bounding Boxes
@@ -534,45 +528,55 @@ For object detection training:
 
 - Label `soccerball` objects with bounding boxes.
 - Label `robot` objects with bounding boxes.
-- Leave `empty` / background images without bounding boxes.
+- Leave `goal` objects with bounding boxes.
 
-Keep bounding boxes tight around the visible object. Consistent labeling usually improves FOMO training results.
-
-### 3. Configure the FOMO Impulse
+Keep bounding boxes tight around the visible object. Consistent labeling usually improves FOMO training results. We have prelabelled a capture dataset for you.
 <div style="display: flex; gap: 10px;">
-  <img src="docs/assets/edge-impulse/4-create-impulse.png" width="45%">
+  <img src="docs/assets/edge-impulse/2-dataset-labels.png" width="80%">
 </div>
 
-#### Input Block
+### 3. Create impulse
+<div style="display: flex; gap: 10px;">
+  <img src="docs/assets/edge-impulse/3-create-impulse.png" width="80%">
+</div>
+
+#### Image Data
 
 - Image size: **96 × 96**
 - Color depth: **RGB**
-- Resize mode: default fit-to-input behavior
+- Resize mode: **squash**
+- Train on data subset: **100%**
 
-#### Input Block
+#### Add a processing block
 
 - Add image (will give you error without this)
 
-#### Learning Block
+#### Add a learning block
 
-- Model: **FOMO MobileNetV2 0.35**
-- Data augmentation: optimized data augmentation
-- Training cycles: **150-180** as a starting range
-- Learning rate: **0.001**
+- Model: **Object Detection (Images)**
+- Input features: **check the Image box**
+- Output features: **3 (goal, robot, soccer_ball)**
+
 
 Adjust these settings if your dataset, target runtime, or accuracy requirements differ.
 
-### 4. Train and Evaluate the Model
+### 4. Image: Feature Generation
 <div style="display: flex; gap: 10px;">
-  <img src="docs/assets/edge-impulse/5-training.png" width="45%">
+  <img src="docs/assets/edge-impulse/4-image-feature-gen.png" width="80%">
 </div>
 
 After training, review the validation metrics and class behavior.
 
-### 5. Export the Trained Model
+### 5. Object Detection: Neural Network Settings
 <div style="display: flex; gap: 10px;">
-  <img src="docs/assets/edge-impulse/7-FOMO-MobileNet.png" width="100%">
+  <img src="docs/assets/edge-impulse/5-neural-network.png" width="100%">
 </div>
+
+#### Training Settings
+- Training cycles: **150-180** as a starting range
+- Learning rate: **0.001**
+- Training processor: **CPU**
+
 After the model performs well enough for live testing, export it as an Edge Impulse `.eim` file for Linux aarch64 if that is the runtime used by your App Lab environment.
 
 The `.eim` file is generated from your own Edge Impulse project and is not included by default.
@@ -584,14 +588,15 @@ models/
   your-model-linux-aarch64.eim
 ```
 
-Or, if using the App Lab inference project directly:
+### 6. Deployment
+<div style="display: flex; gap: 10px;">
+  <img src="docs/assets/edge-impulse/6-deployment.png" width="100%">
+</div>
 
-```text
-python/
-  main.py
-  your-model-linux-aarch64.eim
-```
+#### Configure your deployment
+- Deployment target: Arduino UNO Q
 
+Hit build and download the .eim file for use in your application.
 
 ## Safety and troubleshooting
 
