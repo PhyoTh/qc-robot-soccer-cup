@@ -114,7 +114,7 @@ class WallSideDetector:
         self,
         sat_min: int = 120,
         val_min: int = 70,
-        min_tape_px: int = 250,
+        min_tape_px: int = 50,
         band_top_frac: float = BAND_TOP_FRAC,
         band_bottom_frac: float = BAND_BOTTOM_FRAC,
         min_component_px: int = MIN_COMPONENT_PX,
@@ -127,16 +127,20 @@ class WallSideDetector:
         # on real venue frames the correct colour came in at 0.17%-2.29% of
         # frame, i.e. below or barely above the old 2.0% floor.
         self.min_tape_px = min_tape_px
+        # Deliberately kept LOW. Raising it to 250 was tried as a way to shut
+        # out the Aug 14 speckle flicker and reverted: real distant tape is
+        # faint, and in "red goal from blue" the entire red run is only ~110px,
+        # so a 250 gate rejects genuine tape and gets that frame wrong. The
+        # speckle is dealt with properly by min_component_px below, which
+        # removes noise at source instead of raising the bar for everyone.
+        #
         # NOTE: an area-dominance shortcut ("if one colour has Nx the pixels,
-        # just pick it") was tried here and REMOVED - do not re-add it. It
+        # just pick it") was also tried here and REMOVED - do not re-add it. It
         # looks reasonable but breaks the most important case on this field:
         # a robot hugging the red side wall while facing the blue goal sees a
         # huge near-red band and only a small far-blue one, so any area rule
         # confidently reports RED while the robot is in fact facing BLUE -
         # precisely the own-goal error the centroid rule exists to prevent.
-        # The min_tape_px gate above is sufficient on its own: the speckle
-        # that caused the Aug 14 flapping was ~90px, well under the gate,
-        # while genuine far tape measured 1300px+.
         self.band_top_frac = band_top_frac
         self.band_bottom_frac = band_bottom_frac
         self.min_component_px = min_component_px
@@ -373,25 +377,14 @@ if __name__ == "__main__":
     )
     print(f"  -> RED, despite BLUE having {analysis['blue_px']}px vs {analysis['red_px']}px")
 
-    print("[SELF-TEST] NEW REGRESSION: a small speck near centre must NOT outvote a big band of the other colour")
-    # Reproduces the failure seen on the field Aug 14: parked facing the blue
-    # goal, blue read ~1300px at offset ~100px while red was ~90px of speckle
-    # sitting near frame centre. The centroid rule handed the verdict to the
-    # speckle and the answer flipped RED/BLUE ~20 times while the robot sat
-    # still. Big honest band of blue at the EDGE, tiny red speck at CENTRE.
-    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    # NOTE: a test modelling the Aug 14 speckle as one SOLID 135px block used to
+    # sit here and was removed - it was a bad model of the failure. Real sensor
+    # noise is scattered 1-3px specks, which min_component_px removes; a solid
+    # block is indistinguishable from genuine small tape and SHOULD survive
+    # filtering. The scattered-speckle regression further down tests the real
+    # thing, including asserting the frame still flips with the filter off.
     blue_bgr = cv2.cvtColor(np.uint8([[[115, 220, 200]]]), cv2.COLOR_HSV2BGR)[0, 0]
     red_bgr = cv2.cvtColor(np.uint8([[[5, 220, 200]]]), cv2.COLOR_HSV2BGR)[0, 0]
-    frame[int(240 * 0.25):int(240 * 0.50), 250:310] = blue_bgr   # 60x60 = 3600px, far right
-    frame[int(240 * 0.30):int(240 * 0.34), 155:170] = red_bgr    # ~9x15 = 135px, dead centre
-    analysis = detector.analyze(frame)
-    print(detector.diagnostic_line(analysis))
-    assert analysis["blue_px"] > analysis["red_px"] * 6, "test setup: blue must dominate by >6x"
-    assert analysis["side"] == "BLUE", (
-        f"a {analysis['red_px']}px red speck near centre must not outvote {analysis['blue_px']}px "
-        f"of real blue tape - got {analysis['side']}. Fixed by the min_tape_px gate."
-    )
-    print(f"  -> BLUE ({analysis['blue_px']}px) correctly beat the {analysis['red_px']}px centre speck")
 
     print("[SELF-TEST] NEW REGRESSION: hugging the RED side wall while facing the BLUE goal")
     # The case that killed an earlier area-dominance shortcut. Pressed against
