@@ -39,6 +39,16 @@ CAMERA_URL = "http://192.168.5.1:81/stream"
 DEFAULT_MODEL_PATH = "models/pico-160.eim"
 CAMERA_WARMUP_MAX_FRAMES = 50
 CAMERA_WARMUP_RETRY_DELAY = 0.05
+# Consecutive dead frames before the match loop tears the stream down and
+# reopens it. The ESP32-S3 MJPEG stream drops under load - observed live as
+# "Stream ends prematurely" - and cv2.VideoCapture never recovers on its own.
+# Low enough to lose well under a second of play, high enough that a couple
+# of dropped frames don't cause a needless reconnect (which costs ~1 tick).
+CAMERA_RECONNECT_AFTER_BAD_FRAMES = 5
+# Warmup budget for a MID-MATCH reconnect. Short on purpose: standing still
+# for the full 2.5s warmup mid-game is worse than failing fast and retrying
+# on the next tick.
+CAMERA_RECONNECT_WARMUP_FRAMES = 10
 MAX_MATCH_SECONDS = 6 * 60
 
 
@@ -144,20 +154,26 @@ def _ensure_edge_impulse() -> bool:
         return False
 
 
-def _open_camera():
-    """Open the MJPEG stream, discarding empty frames until a real one lands."""
+def _open_camera(max_frames: int = CAMERA_WARMUP_MAX_FRAMES):
+    """Open the MJPEG stream, discarding empty frames until a real one lands.
+
+    max_frames is lowered for mid-match reconnects: the full warmup blocks for
+    ~2.5s, which is a long time to stand still during a 5-minute game. A
+    reconnect that doesn't take immediately is better retried next tick than
+    waited on.
+    """
     import cv2
 
     print(f"[INFO] connecting to camera: {CAMERA_URL}")
     cap = cv2.VideoCapture(CAMERA_URL)
-    for attempt in range(CAMERA_WARMUP_MAX_FRAMES):
+    for attempt in range(max_frames):
         ok, frame = cap.read()
         if ok and frame is not None and frame.size > 0:
             print(f"[INFO] camera warmed up after {attempt + 1} frame(s)")
             return cap
         time.sleep(CAMERA_WARMUP_RETRY_DELAY)
     cap.release()
-    raise RuntimeError(f"camera produced no usable frame after {CAMERA_WARMUP_MAX_FRAMES} attempts")
+    raise RuntimeError(f"camera produced no usable frame after {max_frames} attempts")
 
 
 def run_match(robot, App, policy_class=None, team_fn=None) -> None:
@@ -207,8 +223,10 @@ def run_match(robot, App, policy_class=None, team_fn=None) -> None:
                 # likely repositioned the robot and ball, so drop any
                 # remembered tracking state rather than acting on a world
                 # that no longer exists.
+                nonlocal cap
                 policy.reset()
                 start = time.monotonic()
+                bad_frames = 0
                 try:
                     while (time.monotonic() - start) < MAX_MATCH_SECONDS and robot.is_running():
                         sensors = robot.read_sensors()
@@ -216,6 +234,29 @@ def run_match(robot, App, policy_class=None, team_fn=None) -> None:
                         frame_ts = time.monotonic()
                         if not ok or frame is None or frame.size == 0:
                             frame = None
+                            bad_frames += 1
+                            # The ESP32-S3 MJPEG stream DOES drop mid-match -
+                            # seen live as "Stream ends prematurely". Once
+                            # that happens cap.read() fails forever, so
+                            # without reopening the socket the robot goes
+                            # permanently blind and just skips ticks for the
+                            # rest of the game. capture.py has always
+                            # reconnected for this reason; the match loop
+                            # must too.
+                            if bad_frames >= CAMERA_RECONNECT_AFTER_BAD_FRAMES:
+                                print(f"[WARN] {bad_frames} dead frames - reopening the camera stream")
+                                try:
+                                    cap.release()
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                try:
+                                    cap = _open_camera(max_frames=CAMERA_RECONNECT_WARMUP_FRAMES)
+                                    print("[INFO] camera stream recovered")
+                                except Exception as exc:  # noqa: BLE001 - keep playing blind-but-alive
+                                    print(f"[WARN] camera reopen failed ({exc}) - will retry")
+                                bad_frames = 0
+                        else:
+                            bad_frames = 0
                         policy.decide_and_act(
                             frame, sensors, detector, wall, team_fn(), frame_ts=frame_ts
                         )
