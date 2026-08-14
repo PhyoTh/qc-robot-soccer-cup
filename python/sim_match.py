@@ -41,6 +41,7 @@ from soccer_policy import (
     POSSESSION_SCAN_SPEED,
     POSSESSION_SCAN_TURN_MS,
     COAST_TICKS,
+    OPENING_SEQUENCE,
 )
 
 
@@ -159,6 +160,12 @@ def run_story() -> None:
 
     robot = _RecordingRobot()
     policy = SoccerPolicy(robot)
+    # Skip the kickoff opening. This story is about how the policy behaves
+    # ACROSS ticks once play is under way (tracking, coasting, foul-avoidance,
+    # own-goal, search alternation); the opening is a fixed open-loop burst
+    # covered by its own tests in soccer_policy.py, and leaving it armed here
+    # would just shift every beat of the story by two ticks.
+    policy._opening_step = len(OPENING_SEQUENCE)
     detector = _ScriptedDetector(detector_script)
     wall = _ScriptedWallDetector(wall_script)
 
