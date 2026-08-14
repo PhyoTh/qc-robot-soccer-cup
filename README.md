@@ -224,6 +224,7 @@ print(robot.read_sensors())
 | `servo(angle)` | Moves the servo/gripper; the sketch clamps the angle to `0..180` degrees. |
 | `buzz()` | Plays a three-part buzzer chirp. |
 | `led(on)` | Sets the onboard RGB and ultrasonic RGB lights to white or off. |
+| `rgb(r, g, b)` | Sets the onboard RGB and ultrasonic RGB lights to an arbitrary color; each channel is clamped to `0..255`. |
 | `drive_raw(m0, m1, m2, m3, ms=500)` | Sets individual motor inputs, each clamped to `-255..255`, with an optional auto-stop duration. |
 | `health()` | Returns the parsed driver identity and interface status. |
 
@@ -594,6 +595,24 @@ models/
 - Deployment target: Arduino UNO Q
 
 Hit build and download the .eim file for use in your application.
+
+## AI soccer layer and Redemption Cup behaviors (match-day code)
+
+Building on the "Model Import" and "Wall / Field-Side Detection" sections above, `python/` also includes a starter match-play stack. Every file below was written and statically validated (`python3 -m py_compile`, plus each file's own built-in self-test) without a physical robot, camera, or trained model attached — they still need on-hardware validation before match play.
+
+| File | Purpose |
+| --- | --- |
+| `python/wall_detector.py` | `WallSideDetector` - pure OpenCV/numpy HSV classifier implementing "Wall / Field-Side Detection" above. Run `python3 python/wall_detector.py` for a camera-free self-test. |
+| `python/ei_runner.py` | `ObjectDetector` - thin wrapper around the Edge Impulse Linux SDK (`edge_impulse_linux.image.ImageImpulseRunner`) for the exported FOMO model (`goal`, `robot`, `soccer_ball`). Expects a `.eim` file, e.g. `models/soccer-linux-aarch64.eim` (not included; export your own per "Model Import" above). |
+| `python/soccer_policy.py` | `SoccerPolicy.decide_and_act()` - the match-play decision loop (Acquire -> Infer -> Validate -> Decide -> Act -> Reobserve). Includes explicit own-goal avoidance (the model's single generic `goal` class is disambiguated via `wall_detector` - see the module docstring) and opponent foul-avoidance tied to the Game Rules' Yellow Card conditions. Run `python3 python/soccer_policy.py` for a hardware-free self-test of every decision branch. |
+| `python/play_match.py` | Optional match-day `App.run(...)` entry point wiring the pieces above together. Does **not** replace `python/main.py` or `app.yaml` - switch `app.yaml`'s entry point to this file only after validating it on real hardware. |
+| `python/celebration.py` | `celebrate(robot)` - Redemption Cup "Best Goal Celebration" (LEDs/spin/buzzer); color-cycles via `robot.rgb()` when available, falls back to `led()` blinking otherwise. |
+| `python/precision_course.py` | `run_precision_course(robot)` - Redemption Cup "Precision Course" line-follower using the 4-channel line sensor. |
+| `python/trick_shot.py` | `TrickShotPolicy` - Redemption Cup "Trick Shot Challenge". Composes `SoccerPolicy` and adds one ultrasonic-based obstacle-dodge branch in front of it. |
+| `python/fastest_ball_detection.py` | `run_fastest_ball_detection(...)` - Redemption Cup "Fastest Ball Detection". Minimal latency-focused loop, separate from `SoccerPolicy`. |
+| `python/sim_match.py` | Multi-tick integration storyboard that runs a single `SoccerPolicy` instance through a scripted ~10-tick match sequence, catching cross-tick state/priority bugs that per-branch self-tests can't. Run `python3 python/sim_match.py`. |
+
+Install `opencv-python`, `numpy`, and `edge_impulse_linux` on the UNO Q's Linux side (`pip install ...`) before wiring these into a live match - none of the three are guaranteed present yet. Every file above (including `wall_detector.py`'s real HSV math) has been verified to actually run and pass its self-test, not just parse - `wall_detector.py` was checked in an isolated venv with `opencv-python-headless`+`numpy` installed since neither is present in the main dev environment.
 
 ## Safety and troubleshooting
 

@@ -47,6 +47,10 @@ class MiniAutoRobot:
     def led(self, on: bool) -> bool:
         return bool(Bridge.call("led", bool(on)))
 
+    def rgb(self, r: int, g: int, b: int) -> bool:
+        """Set the onboard and ultrasonic RGB lights to an arbitrary color, each channel clamped to 0..255."""
+        return bool(Bridge.call("rgb", int(r), int(g), int(b)))
+
     def drive_raw(self, m0: int, m1: int, m2: int, m3: int, ms: int = 500) -> None:
         self._require_running()
         Bridge.call("drive_raw", int(m0), int(m1), int(m2), int(m3), int(ms))

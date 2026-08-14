@@ -495,6 +495,15 @@ bool rpcLed(bool on) {
   return true;
 }
 
+bool rpcRgb(int r, int g, int b) {
+  uint8_t cr = (uint8_t)clampInt(r, 0, 255);
+  uint8_t cg = (uint8_t)clampInt(g, 0, 255);
+  uint8_t cb = (uint8_t)clampInt(b, 0, 255);
+  setRgb(cr, cg, cb);
+  setUltrasonicColor(cr, cg, cb);
+  return true;
+}
+
 bool rpcDriveRaw(int motor0, int motor1, int motor2, int motor3, int durationMs) {
   driveRaw(motor0, motor1, motor2, motor3, durationMs);
   return true;
@@ -516,6 +525,7 @@ void registerBridgeMethods() {
   Bridge.provide_safe("servo", rpcServo);
   Bridge.provide_safe("buzz", rpcBuzz);
   Bridge.provide_safe("led", rpcLed);
+  Bridge.provide_safe("rgb", rpcRgb);
   Bridge.provide_safe("drive_raw", rpcDriveRaw);
   Bridge.provide_safe("health", rpcHealth);
 }
