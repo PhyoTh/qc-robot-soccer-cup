@@ -106,6 +106,13 @@ def _build_tick(robot: MiniAutoRobot, cap, detector, wall: WallSideDetector):
         sequence, so a BOOT-button stop can interrupt between ticks."""
         from robot_client import ProgramStopped  # local import: keeps module import laptop-safe
 
+        # Every fresh session (each BOOT-button re-enable) may follow a
+        # Yellow Card reset, a ref-initiated pause, or just a practice
+        # restart - the robot and ball have very likely been physically
+        # repositioned, so clear any remembered ball tracking/search state
+        # from before rather than act on a world that no longer exists.
+        policy.reset()
+
         start = time.monotonic()
         try:
             while (time.monotonic() - start) < MAX_MATCH_SECONDS and robot.is_running():

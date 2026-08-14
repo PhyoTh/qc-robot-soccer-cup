@@ -169,6 +169,33 @@ ROBOT_EMERGENCY_WIDTH_FRAC = 0.6
 # juking is a low-commitment response, not a retreat.
 ROBOT_JUKE_WIDTH_FRAC = 0.35
 
+# --- De-wedge safety net (design note 4) ------------------------------------
+# True "are we stuck" detection isn't reliable with this sensor suite: the
+# ultrasonic reading to a ball we're successfully pushing looks identical to
+# a ball wedged motionless against a wall - both just say "something is
+# right in front of me" every tick, whether or not the robot is actually
+# translating through space. No wheel encoders means no way to tell
+# progress from a stall. Rather than chase an unreliable "detect stuck"
+# heuristic, this is a cheap, periodic insurance nudge instead: after this
+# many CONSECUTIVE confirmed pushes toward a confirmed opponent goal,
+# peel off sideways once before resuming. Costs almost nothing against a
+# normal fast push (which should reach the goal well before this triggers
+# on a field this size); could save an entire match stalled against a wall
+# if a push genuinely isn't going anywhere. UNVALIDATED GUESS - retune
+# tomorrow once you can see how long a real successful push actually takes.
+DEWEDGE_PUSH_TICKS = 10
+DEWEDGE_SPEED = 130
+DEWEDGE_MS = 200
+
+# --- Escalating search (design note 5) --------------------------------------
+# Plain in-place alternating rotation is probably enough to reacquire the
+# ball fast on a field this small - but costs nothing to widen the pattern
+# with an occasional strafe if a search has genuinely been failing for a
+# while, matching the "patrol wider when initial search fails" approach
+# documented for RoboCup Junior Soccer ball recovery.
+SEARCH_ESCALATE_AFTER_TICKS = 15
+SEARCH_WIDEN_EVERY_TICKS = 5
+
 
 class _BallTracker:
     """Lightweight alpha-beta/EMA-style tracker: smooths a velocity estimate
@@ -239,10 +266,23 @@ class SoccerPolicy:
 
     def __init__(self, robot: "MiniAutoRobot") -> None:
         self.robot = robot
+        self.reset()
+
+    def reset(self) -> None:
+        """Clear every piece of cross-tick state. Call this at the start of
+        every fresh program-enabled session (see play_match.py), not just at
+        construction - after a Yellow Card reset, a ref-initiated pause, or
+        simply pressing BOOT again between practice runs, the robot and ball
+        have very likely been physically repositioned. A remembered ball
+        velocity/position, search-direction bias, or possession-scan/push
+        counter from before that reset describes a world state that no
+        longer exists, and acting on it (e.g. confidently "coasting" toward
+        where the ball used to be) is worse than just starting fresh."""
         self._tracker = _BallTracker()
         self._search_turn_left_next: Optional[bool] = None  # seeded from last-known side on each fresh loss
         self._scan_turn_left_next = True  # alternates the possession-safe "peek" turn
         self._possession_scan_ticks = 0
+        self._consecutive_push_ticks = 0  # see DEWEDGE_PUSH_TICKS
 
     def decide_and_act(
         self,
@@ -305,6 +345,7 @@ class SoccerPolicy:
                     f"bbox_w_frac={bbox_w_frac:.2f}) - emergency back-off"
                 )
                 self._possession_scan_ticks = 0
+                self._consecutive_push_ticks = 0
                 self.robot.drive("backward", speed=APPROACH_SPEED, ms=DRIVE_MS)
                 return
 
@@ -315,16 +356,32 @@ class SoccerPolicy:
                     f"bbox_w_frac={bbox_w_frac:.2f}) - juking {juke_direction} instead of retreating"
                 )
                 self._possession_scan_ticks = 0
+                self._consecutive_push_ticks = 0
                 self.robot.drive(juke_direction, speed=APPROACH_SPEED, ms=TURN_MS)
                 return
 
         # 5) --- BALL CHASE: tracking / coasting / lost ---------------------
         if track_state == "lost":
             self._possession_scan_ticks = 0
+            self._consecutive_push_ticks = 0
             if self._search_turn_left_next is None:
                 self._search_turn_left_next = self._tracker.last_known_side_left(frame_w)
             direction = "rotate_left" if self._search_turn_left_next else "rotate_right"
             self._search_turn_left_next = not self._search_turn_left_next
+
+            # Escalating search (design note 5): once genuinely lost for a
+            # while (past the coast window, then past this extra grace
+            # period too), mix in an occasional strafe instead of only
+            # rotating in place forever, to cover more of the frame.
+            ticks_lost = self._tracker.ticks_since_seen
+            if ticks_lost > SEARCH_ESCALATE_AFTER_TICKS and ticks_lost % SEARCH_WIDEN_EVERY_TICKS == 0:
+                strafe_direction = "left" if direction == "rotate_left" else "right"
+                print(
+                    f"[POLICY] ball lost for {ticks_lost} ticks - widening search with a strafe {strafe_direction}"
+                )
+                self.robot.drive(strafe_direction, speed=SEARCH_SPEED, ms=TURN_MS)
+                return
+
             print(f"[POLICY] ball lost - searching {direction} (biased from last known side)")
             self.robot.drive(direction, speed=SEARCH_SPEED, ms=TURN_MS)
             return
@@ -342,6 +399,7 @@ class SoccerPolicy:
         if abs(offset) > CENTER_DEADZONE_FRAC * frame_w:
             direction = "rotate_left" if offset < 0 else "rotate_right"
             self._possession_scan_ticks = 0
+            self._consecutive_push_ticks = 0
             label = "predicted " if track_state == "coasting" else ""
             print(f"[POLICY] {label}ball off-centre (offset={offset:.0f}px) - turning {direction}")
             self.robot.drive(direction, speed=APPROACH_SPEED, ms=TURN_MS)
@@ -351,6 +409,7 @@ class SoccerPolicy:
             # Centred but not confirmed THIS tick - creep cautiously on the
             # prediction rather than committing to a full-speed push.
             self._possession_scan_ticks = 0
+            self._consecutive_push_ticks = 0
             print(
                 f"[POLICY] predicted ball centred (coasting {self._tracker.ticks_since_seen} "
                 "tick(s)) - cautious creep"
@@ -371,11 +430,29 @@ class SoccerPolicy:
         if goal_side == "OWN SIDE":
             print("[POLICY] ball centred but OWN goal is ahead - peeling off, not pushing")
             self._possession_scan_ticks = 0
+            self._consecutive_push_ticks = 0
             self.robot.drive("right", speed=SEARCH_SPEED, ms=TURN_MS)
             return
 
         if goal_side == "OPPONENT SIDE":
             self._possession_scan_ticks = 0
+
+            # De-wedge safety net (design note 4): after enough CONSECUTIVE
+            # confirmed pushes with nothing else interrupting, insert one
+            # cheap sideways nudge before resuming, on the theory that a
+            # push that were going to succeed usually would have by now.
+            self._consecutive_push_ticks += 1
+            if self._consecutive_push_ticks > DEWEDGE_PUSH_TICKS:
+                self._consecutive_push_ticks = 0
+                nudge_direction = "left" if self._scan_turn_left_next else "right"
+                self._scan_turn_left_next = not self._scan_turn_left_next
+                print(
+                    f"[POLICY] {DEWEDGE_PUSH_TICKS}+ consecutive pushes with no resolution - "
+                    f"de-wedge nudge {nudge_direction} in case the ball is pinned against something"
+                )
+                self.robot.drive(nudge_direction, speed=DEWEDGE_SPEED, ms=DEWEDGE_MS)
+                return
+
             size_frac = min(ball_w / frame_w, 1.0)
             speed = max(int(APPROACH_SPEED * (1.0 - size_frac)), MIN_APPROACH_SPEED)
             print(f"[POLICY] ball centred (size_frac={size_frac:.2f}) - approaching opponent goal at speed={speed}")
@@ -387,6 +464,7 @@ class SoccerPolicy:
         # ball (no retreat, no drive-away - that surrenders it) while
         # peeking to try to resolve which goal this is, for a bounded grace
         # period before cautiously proceeding anyway.
+        self._consecutive_push_ticks = 0
         self._possession_scan_ticks += 1
         if self._possession_scan_ticks > POSSESSION_SCAN_GRACE_TICKS:
             print(
@@ -654,5 +732,61 @@ if __name__ == "__main__":
     policy = SoccerPolicy(robot)
     policy.decide_and_act(None, ENABLED_SENSORS, _FakeDetector([]), wall_unknown, hold_toggle=False)
     assert robot.calls == [("stop",)], robot.calls
+
+    print("[SELF-TEST] NEW: de-wedge - sustained confirmed pushes trigger one nudge, then resume pushing")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    opp_goal_detector = _FakeDetector([ball, goal])
+    for i in range(DEWEDGE_PUSH_TICKS):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, opp_goal_detector, _FakeWallDetector("OPPONENT SIDE"), hold_toggle=False)
+        assert robot.calls[-1][1] == "forward", (
+            f"expected a normal push on tick {i + 1}/{DEWEDGE_PUSH_TICKS}, got {robot.calls[-1]}"
+        )
+    nudge_tick = robot.calls[-1]
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, opp_goal_detector, _FakeWallDetector("OPPONENT SIDE"), hold_toggle=False)
+    nudge = robot.calls[-1]
+    assert nudge[0] == "drive" and nudge[1] in ("left", "right") and nudge[2:] == (DEWEDGE_SPEED, DEWEDGE_MS), (
+        f"expected a de-wedge nudge after {DEWEDGE_PUSH_TICKS} consecutive pushes, got {nudge}"
+    )
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, opp_goal_detector, _FakeWallDetector("OPPONENT SIDE"), hold_toggle=False)
+    assert robot.calls[-1][1] == "forward", f"expected pushing to resume right after the nudge, got {robot.calls[-1]}"
+    print(f"  -> pushed normally for {DEWEDGE_PUSH_TICKS} ticks, nudged once ({nudge}), then resumed pushing")
+
+    print("[SELF-TEST] NEW: escalating search - widens with a strafe after prolonged loss, not forever in-place")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    never_seen_detector = _FakeDetector([])
+    widened = False
+    for i in range(SEARCH_ESCALATE_AFTER_TICKS + SEARCH_WIDEN_EVERY_TICKS + 1):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, never_seen_detector, wall_unknown, hold_toggle=False)
+        if robot.calls[-1][1] in ("left", "right"):
+            widened = True
+            break
+    assert widened, "expected the search to eventually widen into a strafe, got only rotations: " + str(robot.calls)
+    print(f"  -> search widened into a strafe ({robot.calls[-1]}) after prolonged loss, not endless in-place rotation")
+
+    print("[SELF-TEST] NEW: reset() clears all cross-tick state - stale tracking doesn't survive a fresh session")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    # Build up real state: track the ball, then lose it (search bias set), then rack up scan/push ticks.
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([ball]), wall_unknown, hold_toggle=False)
+    assert policy._tracker.last_center_x is not None, "expected the tracker to have real state before reset"
+    policy.reset()
+    assert policy._tracker.last_center_x is None, "reset() must clear the ball tracker"
+    assert policy._search_turn_left_next is None, "reset() must clear the search-direction seed"
+    assert policy._possession_scan_ticks == 0, "reset() must clear the possession-scan counter"
+    assert policy._consecutive_push_ticks == 0, "reset() must clear the de-wedge push counter"
+    # And behaviourally: immediately after reset(), a never-before-seen ball is "tracking", not "coasting"
+    # on stale velocity - i.e. reset() really did forget the old ball, not just its counters.
+    robot2 = _FakeRobot()
+    policy2 = SoccerPolicy(robot2)
+    far_left_ball = _FakeDetection("soccer_ball", 0.9, x=0, y=150, width=20, height=20)
+    policy2.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([far_left_ball]), wall_unknown, hold_toggle=False)
+    policy2.reset()
+    policy2.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([]), wall_unknown, hold_toggle=False)
+    assert robot2.calls[-1][2:] == (SEARCH_SPEED, TURN_MS), (
+        "expected a fresh search after reset(), not a coast/prediction carried over from before it", robot2.calls[-1]
+    )
+    print("  -> reset() cleared tracker, search bias, and both tick counters; no stale state survived")
 
     print("SELF-TEST PASSED")

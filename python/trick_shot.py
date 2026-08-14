@@ -76,6 +76,14 @@ class TrickShotPolicy:
         self._policy = SoccerPolicy(robot)
         self._dodge_left_next = True  # alternates left/right dodge, same idea as SoccerPolicy's search alternation
 
+    def reset(self) -> None:
+        """Passthrough to the wrapped SoccerPolicy's reset() - see its
+        docstring. Call this at the start of every fresh program-enabled
+        session for the same reason: stale ball-tracking/search state from
+        before a pause or reposition shouldn't carry into a new one."""
+        self._policy.reset()
+        self._dodge_left_next = True
+
     def decide_and_act(
         self,
         frame_bgr,
