@@ -46,6 +46,7 @@ Since the robot isn't here today, everything below was written, `python3 -m py_c
 | `python/trick_shot.py` | Redemption Cup **Trick Shot Challenge**: `TrickShotPolicy` composes `SoccerPolicy` and adds one ultrasonic obstacle-dodge branch in front of it. | `python3 python/trick_shot.py` — dodges a real obstacle, alternates dodge direction, correctly does *not* dodge when a close/centered ball explains the reading, delegates everything else unchanged. |
 | `python/fastest_ball_detection.py` | Redemption Cup **Fastest Ball Detection**: minimal latency-focused "see ball, move, done" loop, deliberately separate from `SoccerPolicy` (no goal/opponent logic to pay for). | `python3 python/fastest_ball_detection.py` — exactly one `drive()` call, sane elapsed time, timeout path never drives blind. |
 | `python/sim_match.py` | Not a challenge — a multi-tick integration storyboard that runs one `SoccerPolicy` instance through a scripted ~10-tick match (lose ball → find it → foul-avoidance interrupt → own-goal fake-out → score), catching cross-tick bugs the per-branch tests can't. | `python3 python/sim_match.py` |
+| `python/diagnostics.py` | **Run this first tomorrow.** One-command morning bring-up check: robot health/sensors, camera stream, live wall-tape HSV calibration read, model load + one live inference — consolidates 5 separate manual checks into one. Every check is independent, so one failure doesn't block the rest. | `python3 python/diagnostics.py --model models/soccer-pico-160.eim` |
 
 Also added tonight (small, low-risk, done directly rather than via draft code):
 - **`robot.rgb(r, g, b)`** — new method on `MiniAutoRobot`, backed by a new `rgb` Bridge RPC in `sketch/sketch.ino` (mirrors the firmware's already-working serial `rgb r g b` command exactly). Lets the celebration routine show real colors instead of just white/off. **This needs a firmware reflash tomorrow to take effect** — until then, `celebration.py` automatically falls back to plain LED blinking (it checks `hasattr(robot, "rgb")` first).
@@ -65,15 +66,38 @@ Also new tonight: a **hybrid ball tracker** (`_BallTracker` in `soccer_policy.py
 
 Sources consulted for the tracking design: [RoboCup Junior ball tracker (GitHub)](https://github.com/aul12/ROBOT), [Ball Detection and Tracking with Different Embedded Systems in the RoboCup Soccer context](https://www.researchgate.net/publication/376243587_Ball_Detection_and_Tracking_with_Different_Embedded_Systems_in_the_RoboCup_Soccer_context), [Real-time Localization of a Soccer Ball from a Single Camera](https://arxiv.org/pdf/2506.07981).
 
+## 3.5 Model tuning results (Edge Impulse, done overnight) — full sweep, for context
+
+Trained on **YOLO-Pro** (not FOMO — a deliberate switch, see reasoning below), swept model size and input resolution across six configurations:
+
+| Config | mAP@50 | mAP@75 | Precision | float32 latency (Arduino UNO Q) |
+| --- | --- | --- | --- | --- |
+| small (6.9M), 96×96 | 0.79 | 0.25 | 82.8% | 154 ms |
+| **nano (2.4M), 192×192 — saved as `soccer-nano-192.eim`** | **0.94** | **0.58** | **90.1%** | **118 ms** |
+| **pico (682K), 160×160 — saved as `soccer-pico-160.eim`** | **0.91** | **0.46** | **88.8%** | **26 ms** |
+| nano (2.4M), 160×160 | 0.90 | 0.43 | 87.2% | ~88 ms (est.) |
+| pico (682K), 192×192 | 0.90 | 0.48 | 89.8% | 47 ms |
+
+**Two non-dominated candidates survive**, both downloaded: nano/192 (best accuracy) and pico/160 (best speed, 4.5× faster than nano/192 for a ~3-point mAP@50 cost). Nothing else in the sweep beats both on its own axis, so the search is closed — **don't run more Edge Impulse experiments unless real hardware testing tomorrow specifically motivates one.**
+
+**Why YOLO-Pro instead of FOMO** (the architecture README.md's "Model Import" section documents): FOMO predicts fixed-size grid-cell boxes, not real bounding boxes — its reported width/height don't scale with how close an object actually is. `soccer_policy.py`'s speed-scaling and `trick_shot.py`'s ball-vs-obstacle disambiguation both depend on real bounding-box size as a proximity signal, so YOLO-Pro's genuine variable-size boxes are a better fit for this codebase, not just a random choice.
+
+**Why float32 beats int8 on this specific model/chip** (verified 4 separate times, not a fluke): unclear exactly why, but consistent — the Deployment tab's Arduino-UNO-Q-specific profiler showed Unoptimized (float32) meaningfully faster than Quantized (int8) in every single config tested. Accuracy-wise this costs nothing (full precision is never *less* accurate than its quantized version). If you retrain again for any reason, check both anyway before assuming the pattern holds forever.
+
+**Which one to actually use in the match is still an open, real decision** — pico/160's 26ms is comfortably invisible against the ~150-250ms `robot.drive()` pulse durations already baked into every tick, which matters a lot on the tiny field from tonight's demo footage; nano/192's higher accuracy matters more if false negatives (missing the ball/goal entirely) turn out to be the bigger practical problem once you're actually watching it play. **Test both for real tomorrow — `python3 python/diagnostics.py --model <path>` is the fastest way to sanity-check either one loads and detects correctly before committing to it for a match.**
+
 ## 4. Role assignments
 
 You gave me "2 CS majors, 2 EE majors, 1 BME major" with no names — assignments below are by skill-fit; swap freely, this is a starting point, not a mandate. Each role has a **today** (software/planning only) and **tomorrow** (hardware) column.
 
 ### CS #1 — Model / Edge Impulse Lead
-- **Step zero — this is browser-only and needs zero hardware, do it right now:** the public link (`studio.edgeimpulse.com/public/1085406/live`) is a **read-only** view someone else owns — notice the "Clone this project" button. Click it (log into your own free Edge Impulse account first if needed) to get your own **editable copy** with the 321 images and the already-trained impulse. You can't add data, retrain, or export from the public view.
-- **Then, in your cloned copy:** (1) Data acquisition tab — check the class balance (how many `goal`/`robot`/`soccer_ball` boxes exist); (2) spot-check a handful of samples, especially blurry ones — the dataset was auto-labelled by a model (`owlv2`), not a person, so some boxes may be loose or wrong; (3) Model testing tab — check **per-class** precision/recall, not just the aggregate 92.8%, since FOMO models often have one weak class dragging the average up; (4) add labeled images covering edge cases: ball partially hidden behind/under the robot, ball right at the goal mouth, robot at varying distance/angle, different lighting, and a few background-only frames (matches `capture.py`'s `empty` label — confirm those negatives are actually in the dataset, FOMO benefits a lot from them); (5) Retrain model tab — rerun training (150–180 cycles, LR 0.001, per README), re-check per-class metrics, aim for >90% on each class individually. "Live classification" lets you test against any photo you upload or a webcam, without the robot.
-- **Tonight, once satisfied:** export **Deployment target: Linux (aarch64)**, download the `.eim`, and get it onto a USB stick / shared drive the team can access tomorrow without depending on venue Wi-Fi. Name it to match `play_match.py`'s default: `models/soccer-linux-aarch64.eim` (or set `EI_MODEL_PATH` at runtime to whatever you actually name it).
-- **Tomorrow:** if venue lighting differs noticeably from your capture setup, use `python/capture.py` (already in the repo) to grab a quick batch of venue-lit images and do one fast retrain/re-export before the model gets locked in for matches.
+- **Done tonight — model training is finished, not a tomorrow task anymore.** Cloned the project into an editable copy (`studio.edgeimpulse.com/studio/1087912/...`), and after a full tuning sweep (documented below in §3.5), landed on **two saved, downloaded `.eim` files** — no more Edge Impulse experimentation needed unless real hardware testing tomorrow reveals a real problem with both.
+- **Two model candidates, both already exported and downloaded:**
+  - `soccer-nano-192.eim` — **accuracy-favoring**: mAP@50 0.94, 118ms inference. Architecture: YOLO-Pro, nano (2.4M), 192×192 input.
+  - `soccer-pico-160.eim` — **speed-favoring**: mAP@50 0.91, only 26ms inference. Architecture: YOLO-Pro, pico (682K), 160×160 input.
+  - Both use **Unoptimized (float32)**, not Quantized (int8) — counterintuitively float32 is 2-4.5× *faster* than int8 for this specific architecture on the Arduino UNO Q's Qualcomm QRB2210, a real, repeatedly-verified quirk, not a mistake. Don't "optimize" back to int8 thinking it'll help — it won't, for this model/chip combo.
+  - Deployment target for both: **"Arduino UNO Q"** specifically (not "C++ library," not a generic "Linux (AARCH64)") — it's the board-specific `.eim`-producing profile.
+- **Tomorrow:** rename/place whichever one you want to try first at `models/soccer-linux-aarch64.eim` (or set `EI_MODEL_PATH` to its actual filename), then run `python3 python/diagnostics.py` — it loads the model, prints its labels, and runs one live inference against the camera in a single command. **This is the very first thing to run once the robot and camera are both up** — see §3.5 for the full model comparison and why we didn't just pick one blind. If venue lighting differs noticeably from capture conditions, `python/capture.py` can grab a quick batch of venue-lit images for a fast retrain — but only if there's real time left after hardware bring-up and integration, which are now the priority.
 
 ### CS #2 — Policy & Integration Lead
 - **Today:** Read `python/soccer_policy.py`, `python/play_match.py`, and `python/ei_runner.py` end to end — you own tuning and hardware integration tomorrow, so understand every branch now, not under time pressure later. Note the tunable constants at the top of `soccer_policy.py` (`CENTER_DEADZONE_FRAC`, `APPROACH_SPEED`, `COAST_TICKS`, `POSSESSION_SCAN_GRACE_TICKS`, `CONTESTED_MM`, `COLLISION_IMMINENT_MM`, etc.) — these were reasoned defaults, not measured ones, and §7 below explains why the field being much smaller than expected makes several of them suspect. Flag which look wrong for your actual field size/camera FOV so you're ready to retune fast tomorrow.
@@ -93,20 +117,25 @@ You gave me "2 CS majors, 2 EE majors, 1 BME major" with no names — assignment
 
 ## 5. Suggested tomorrow timeline (tight — 5 dev hours total)
 
+**Updated from the original plan: model training and code are both done overnight, not tomorrow's job anymore.** That frees real time in the 11 AM–4 PM window for what actually needs hands-on-hardware time — integration, calibration, and match rehearsal.
+
 | Time | Focus | Who |
 | --- | --- | --- |
-| 9:00–10:00 | Check-in; unbox/inspect kit; charge battery if not already | EE #1, EE #2 |
-| 10:00–11:00 | EI workshop (mandatory) — listen for anything that changes the export/deploy steps | Everyone, CS #1 leads |
-| 11:00–11:45 | Flash `sketch.ino` + verify `health()`; flash/verify camera stream; finalize + export model with any workshop guidance; run the static integration gate on any last-minute changes | EE #1 / EE #2 / CS #1 / BME |
-| 11:45–12:30 | Sensor validation (wheels raised); drop the `.eim` into `models/`; live-tune `wall_detector.py` against real field tape | EE #2 |
-| 12:30–1:15 | Wire `ei_runner` + `soccer_policy` + `play_match` on real hardware, wheels-raised dry run | CS #2 |
-| 1:15–2:00 | Wheels-down open-area test; tune speeds/deadzone; **deliberately verify own-goal avoidance** | CS #2, EE #2 |
-| 2:00–2:45 | Redemption Cup dry runs (`celebration.py`, `precision_course.py`) on hardware | BME, whoever's free |
-| 2:45–3:30 | Full mock 5-minute matches; practice yellow-card restart; confirm BOOT-button operator handoff | Everyone |
-| 3:30–4:00 | Buffer; switch `app.yaml` to `play_match.py` once validated; final charge | Everyone |
+| 9:00–9:30 | Check-in; unbox/inspect kit; charge battery if not already | EE #1, EE #2 |
+| 9:30–10:00 | `pip install opencv-python numpy edge_impulse_linux` on the robot's Linux side — do this before the workshop saturates venue Wi-Fi | EE #1 |
+| 10:00–11:00 | EI workshop (mandatory) | Everyone |
+| 11:00–11:30 | Flash `sketch.ino` + verify `health()`; flash/verify camera stream | EE #1, EE #2 |
+| 11:30–11:45 | Drop both `.eim` files (`soccer-nano-192.eim`, `soccer-pico-160.eim`) into `models/`; run **`python3 python/diagnostics.py`** — the first real, hardware-validated pass on health/sensors/camera/wall-tape/model, all in one command | Whole team, one laptop |
+| 11:45–12:15 | A/B the two models directly via `diagnostics.py --model <path>` against a real ball/robot/goal in front of the camera; pick a starting one (swappable later via `EI_MODEL_PATH`) | CS #1, CS #2 |
+| 12:15–1:00 | Wire `ei_runner` + `soccer_policy` + `play_match` on real hardware, wheels-raised dry run; live-tune `wall_detector.py`'s HSV thresholds against real field tape (see §3.5 — **confirm the tape actually exists on this field first**) | CS #2, EE #2 |
+| 1:00–1:45 | Wheels-down open-area test; tune speeds/deadzone; **deliberately verify own-goal avoidance AND the opponent juke-vs-retreat split** (see §3's design notes) | CS #2, EE #2 |
+| 1:45–2:30 | Redemption Cup dry runs on hardware: `celebration.py`, `precision_course.py`, `trick_shot.py`, `fastest_ball_detection.py` | BME, whoever's free |
+| 2:30–3:15 | Full mock 5-minute matches; practice yellow-card restart; confirm BOOT-button operator handoff | Everyone |
+| 3:15–3:45 | Buffer; switch `app.yaml` to `play_match.py` once validated; final charge | Everyone |
+| 3:45–4:00 | Final gear check | Everyone |
 | 4:00 PM | **Tournament starts** | — |
 
-If something's behind schedule at 1:15, cut scope in this order: Redemption Cup polish → own-goal-avoidance live verification (keep it in code, just skip the live drill) → mock matches. Do **not** cut the wheels-raised sanity checks — that's how you avoid a match-day surprise.
+If something's behind schedule at 1:00, cut scope in this order: Redemption Cup dry runs → own-goal/juke live verification (keep it in code, just skip the live drill) → mock matches. Do **not** cut the wheels-raised sanity checks — that's how you avoid a match-day surprise.
 
 ## 6. Redemption Cup — pick order if eliminated
 
@@ -126,7 +155,7 @@ If something's behind schedule at 1:15, cut scope in this order: Redemption Cup 
 - **The field is TINY.** From the same demo footage, the whole field looks roughly coffee-table-sized — robots and the ball are large relative to the playing area, and everything (approach, contact, going out of frame) happens fast and close. This directly undercuts several of tonight's placeholder constants: `APPROACH_SPEED=150`, `CONTESTED_MM=200`, and `COLLISION_IMMINENT_MM=100` were picked with no real sense of scale, and a 200mm "contested" zone could be a huge fraction of the entire field width. **Start tomorrow's first tests at noticeably lower speeds than the current defaults** — it's much easier to speed a working policy up than to debug a robot that's already put a dent in the wall. Mecanum sideways strafing (`drive("left"/"right")`) is confirmed working in the footage, which the juke/possession-scan logic already leans on.
 - **The Edge Impulse dataset was auto-labelled, not hand-labelled — spot check it.** The sample metadata shows `labeled_by: owlv2` (an automatic zero-shot object detector, not a person) with a text prompt like "a black and white soccer ball." Auto-labelling can miss or misplace boxes, especially on the motion-blurred frames visible in the dataset. Before trusting the model's metrics, spot-check a handful of boxes — particularly any blurry ones — and tighten/fix any that are off; the README's own "Model Import" instructions already say to keep boxes tight.
 - **Venue lighting ≠ home lighting.** Both `wall_detector.py`'s HSV thresholds and the Edge Impulse model were tuned/trained on your existing captures — budget real time tomorrow to retune, don't assume either transfers directly.
-- **The `.eim` file doesn't exist yet.** `ei_runner.py` and `play_match.py` will refuse to run (with a clear message, not a crash) until CS #1 exports one into `models/`.
+- **Both `.eim` files are exported and downloaded, but neither has run on real hardware yet.** They're `edge_impulse_linux` binaries built specifically for the Arduino UNO Q's aarch64 Linux side — they won't run on anyone's laptop to pre-check, Mac or otherwise. The very first real test of either one is tomorrow via `python3 python/diagnostics.py`. Don't assume they work until that's actually happened.
 - **`robot.rgb()` needs a firmware reflash** to actually change colors — until `sketch.ino` is reflashed tomorrow, `celebration.py` silently falls back to plain LED blink, which is fine but less impressive.
 - **Own-goal avoidance depends on wall-tape visibility — updated behavior.** If the camera can't see the field tape (bad angle, glare) or there's no goal in view at all, `goal_side` is unresolved and the policy no longer defaults to pushing forward (it did in the first draft — flagged as risky and since fixed based on team feedback). It now does small "peek" scans to protect the ball while trying to resolve which goal is which, for a bounded grace period (`POSSESSION_SCAN_GRACE_TICKS`) before cautiously proceeding anyway. **`POSSESSION_SCAN_GRACE_TICKS` is a real risk-tolerance dial the team should own** — shorter means more stalling risk, longer means more time spent not advancing the ball. Pick a value together tomorrow once you can see how it feels on real hardware.
 - **Opponent contact is now two-tier, not one soft threshold.** Ordinary contested closeness (`CONTESTED_MM`) jukes sideways instead of retreating — only genuinely imminent contact (`COLLISION_IMMINENT_MM`, tighter) triggers a full backoff. This was changed specifically because the original single-threshold version was exploitable: an opponent camping near the ball/us could force repeated retreats without ever committing a foul themselves. Both distance thresholds and both bbox-size thresholds are still unvalidated guesses — retune with real opponents tomorrow, and if anything, err toward less skittish, not more.
