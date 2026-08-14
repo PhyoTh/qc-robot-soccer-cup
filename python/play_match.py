@@ -159,7 +159,9 @@ def main() -> None:
     wall = WallSideDetector()
 
     try:
-        with ei_runner.ObjectDetector(model_path) as detector:
+        # See main.py: must stay at or below soccer_policy's lowest per-class
+        # floor, since this filter runs before the policy's own thresholds.
+        with ei_runner.ObjectDetector(model_path, min_confidence=0.35) as detector:
             print("[INFO] model loaded - starting match loop")
             print("[INFO] waiting for BOOT button to start...")
             tick = _build_tick(robot, cap, detector, wall)

@@ -127,7 +127,11 @@ def run_match(robot, App, policy_class=None) -> None:
     wall = WallSideDetector()
 
     try:
-        with ei_runner.ObjectDetector(model_path) as detector:
+        # min_confidence here must stay at or below the LOWEST per-class floor
+        # in soccer_policy.MIN_CONFIDENCE_BY_LABEL - this filter runs first, so
+        # anything it drops can never reach the policy's own thresholds. The
+        # policy does the real per-class filtering; this one just trims noise.
+        with ei_runner.ObjectDetector(model_path, min_confidence=0.35) as detector:
             print(f"[INFO] model loaded: {model_path}")
             policy = policy_class(robot)
             print("[INFO] waiting for BOOT button to start...")

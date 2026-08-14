@@ -94,7 +94,26 @@ if TYPE_CHECKING:
 # Detections below this confidence are treated as "not seen" even though
 # ei_runner.ObjectDetector may have its own (possibly looser) internal
 # min_confidence - this is the policy's own, independently-tunable bar.
-MIN_CONFIDENCE = 0.6
+# Per-class confidence floors. MEASURED AT THE VENUE (Aug 14), not guessed:
+# with the robot parked facing the red goal, the goal class scored 0.52-0.72
+# (mean ~0.57) across 54 consecutive frames. A single 0.6 bar therefore threw
+# away most true goal sightings, which is exactly what made goal detection
+# look broken on the field - the model saw it, the threshold discarded it.
+#
+# Ball and robot keep the stricter 0.6: the ball class was the strongest in
+# training (~100%) so it does not need the help, and a false ball chase is
+# worse than a missed one. Goal gets 0.45, comfortably under the observed
+# spread but still well above noise.
+#
+# NOTE ei_runner.ObjectDetector applies its OWN floor before the policy sees
+# anything - it must be constructed with a min_confidence at or below the
+# lowest value here or these thresholds can never fire. See main.py.
+MIN_CONFIDENCE_BY_LABEL = {
+    "soccer_ball": 0.6,
+    "robot": 0.6,
+    "goal": 0.45,
+}
+MIN_CONFIDENCE = 0.6  # fallback for any label not listed above
 
 # Never drive on a camera frame older than this - a stale frame means we are
 # steering blind, which is worse than not moving.
@@ -517,7 +536,10 @@ class SoccerPolicy:
 
     @staticmethod
     def _above_threshold(detection: Optional["Detection"]) -> Optional["Detection"]:
-        if detection is None or detection.confidence < MIN_CONFIDENCE:
+        if detection is None:
+            return None
+        floor = MIN_CONFIDENCE_BY_LABEL.get(detection.label, MIN_CONFIDENCE)
+        if detection.confidence < floor:
             return None
         return detection
 
@@ -602,6 +624,19 @@ if __name__ == "__main__":
 
     FRAME = _FakeFrame(240, 320)  # centre x = 160
     ENABLED_SENSORS = {"program_enabled": True, "ultrasonic_mm": -1}
+
+    print("[SELF-TEST] NEW: per-class confidence floors - a 0.55 goal is accepted, a 0.55 ball is not")
+    # Measured at the venue: real goal sightings land ~0.52-0.72. A single 0.6
+    # bar discarded most of them, which is what made goal detection look broken.
+    _mid_goal = _FakeDetection("goal", 0.55, x=100, y=20, width=120, height=60)
+    _mid_ball = _FakeDetection("soccer_ball", 0.55, x=150, y=150, width=20, height=20)
+    assert SoccerPolicy._above_threshold(_mid_goal) is not None, (
+        "a 0.55 goal must pass - this is the real-world range, and rejecting it is the bug we fixed"
+    )
+    assert SoccerPolicy._above_threshold(_mid_ball) is None, (
+        "a 0.55 ball must still be rejected - the ball class is strong, and a phantom ball chase is costly"
+    )
+    print(f"  -> goal floor={MIN_CONFIDENCE_BY_LABEL['goal']}, ball floor={MIN_CONFIDENCE_BY_LABEL['soccer_ball']}")
 
     print("[SELF-TEST] own-goal avoidance: centred ball + OWN SIDE goal -> peel off, never forward")
     robot = _FakeRobot()
