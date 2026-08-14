@@ -125,8 +125,11 @@ class TrickShotPolicy:
             try:
                 detections = detector.infer(frame_bgr)
             except Exception as exc:  # noqa: BLE001 - one bad frame must not crash the match loop
-                print(f"[WARN] trick_shot: inference failed ({exc}) - stopping")
-                self.robot.stop()
+                # Must NOT call robot.stop() here - it sets program_enabled
+                # =false and ends the whole run (see soccer_policy design note
+                # 8). Returning is already safe: drive() pulses are bounded and
+                # the firmware auto-stops them.
+                print(f"[WARN] trick_shot: inference failed ({exc}) - skipping tick")
                 return
 
             ball = detector.best(detections, "soccer_ball")
@@ -291,11 +294,14 @@ if __name__ == "__main__":
     policy.decide_and_act(FRAME, disabled_sensors, _FakeDetector([]), WALL, hold_toggle=False)
     assert robot.calls == [], robot.calls
 
-    print("[SELF-TEST] missing frame -> delegates to inner policy, stop(), never drive blind")
+    print("[SELF-TEST] missing frame -> skips the tick, never drives blind, never ends the session")
     robot = _FakeRobot()
     policy = TrickShotPolicy(robot)
     enabled_sensors = {"program_enabled": True, "ultrasonic_mm": -1}
     policy.decide_and_act(None, enabled_sensors, _FakeDetector([]), WALL, hold_toggle=False)
-    assert robot.calls == [("stop",)], robot.calls
+    # Must not drive (no vision) and must not stop() either - stop() sets
+    # program_enabled=false in firmware and ends the run until someone presses
+    # BOOT again. See soccer_policy design note 8.
+    assert robot.calls == [], f"expected a silent skipped tick, got {robot.calls}"
 
     print("SELF-TEST PASSED")

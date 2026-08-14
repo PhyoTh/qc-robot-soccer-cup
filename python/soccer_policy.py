@@ -100,6 +100,26 @@ THREE PIECES OF NON-OBVIOUS DESIGN IN THIS FILE, READ BEFORE TUNING:
    not a tradeoff. It does not touch ball detection or aiming: those branches
    return before reaching this code.
 
+8. THIS POLICY NEVER CALLS robot.stop() - AND MUST NOT. The firmware's stop
+   RPC does not merely halt the motors, it also sets program_enabled=false
+   (see rpcStop in sketch/sketch.ino), which ends the whole run: the caller's
+   `while robot.is_running()` loop exits and a human has to press the BOOT
+   button again to resume. The developer guide flags this too - stop() is a
+   session-ending fail-safe and finally-cleanup call, not a control-flow tool.
+
+   An earlier version of this file called stop() on a missing frame, a stale
+   frame, an empty frame, or an inference error. All four are TRANSIENT, and
+   over a Wi-Fi MJPEG stream competing with ~30 other robot APs in the room,
+   a dropped frame during a 5-minute match is close to certain. So the robot
+   would shut itself off mid-match on the first hiccup and sit dead until
+   someone re-pressed BOOT. Caught by a teammate before the tournament.
+
+   Simply returning is already the correct safe response: every drive() this
+   policy issues is a bounded 150-250ms pulse that the firmware auto-stops on
+   its own timer, so a skipped tick coasts to a halt within one pulse and
+   play resumes the moment frames return. Session-ending stop() belongs only
+   in the caller's finally block (see main.py).
+
 Only project-local modules (ei_runner, wall_detector, robot_client) are
 imported here, and only under TYPE_CHECKING - decide_and_act() only ever
 touches the objects it's handed through duck typing (frame.shape,
@@ -373,30 +393,31 @@ class SoccerPolicy:
         if not sensors.get("program_enabled"):
             return
 
-        # 2) Never drive on missing or stale vision.
+        # 2) Never drive on missing or stale vision - but do NOT call
+        # robot.stop() here. See design note 8: stop() ends the whole session.
+        # Simply returning is already a safe no-op, because every drive() this
+        # policy issues is a bounded 150-250ms pulse that the FIRMWARE
+        # auto-stops on its own timer. Skipping a tick therefore coasts to a
+        # halt within one pulse and resumes the instant frames come back.
         if frame_bgr is None:
-            print("[WARN] soccer_policy: no camera frame available - stopping")
-            self.robot.stop()
+            print("[WARN] soccer_policy: no camera frame this tick - skipping (motors auto-stop)")
             return
         if frame_ts is None:
             frame_ts = now
         elif (now - frame_ts) > FRAME_STALE_SEC:
-            print(f"[WARN] soccer_policy: frame is {now - frame_ts:.2f}s stale - stopping")
-            self.robot.stop()
+            print(f"[WARN] soccer_policy: frame is {now - frame_ts:.2f}s stale - skipping tick")
             return
 
         frame_h, frame_w = frame_bgr.shape[0], frame_bgr.shape[1]
         if frame_w <= 0 or frame_h <= 0:
-            print("[WARN] soccer_policy: empty frame - stopping")
-            self.robot.stop()
+            print("[WARN] soccer_policy: empty frame - skipping tick")
             return
 
         # 3) Infer, then Validate against our own confidence bar.
         try:
             detections = detector.infer(frame_bgr)
         except Exception as exc:  # noqa: BLE001 - one bad frame must not crash the match loop
-            print(f"[WARN] soccer_policy: inference failed ({exc}) - stopping")
-            self.robot.stop()
+            print(f"[WARN] soccer_policy: inference failed ({exc}) - skipping tick")
             return
 
         opponent = self._above_threshold(detector.best(detections, "robot"))
@@ -864,11 +885,35 @@ if __name__ == "__main__":
     policy.decide_and_act(FRAME, disabled_sensors, _FakeDetector([]), wall_unknown, hold_toggle=False)
     assert robot.calls == [], robot.calls
 
-    print("[SELF-TEST] missing frame -> stop(), never drive blind")
-    robot = _FakeRobot()
-    policy = SoccerPolicy(robot)
-    policy.decide_and_act(None, ENABLED_SENSORS, _FakeDetector([]), wall_unknown, hold_toggle=False)
-    assert robot.calls == [("stop",)], robot.calls
+    print("[SELF-TEST] CRITICAL: a transient camera/inference failure must NEVER call stop()")
+    # stop() sets program_enabled=false in firmware, ending the run until a
+    # human re-presses BOOT. Over a Wi-Fi MJPEG stream sharing the room with
+    # ~30 other robot APs, a dropped frame in a 5-minute match is near certain
+    # - so calling stop() here means the robot shuts itself off mid-match on
+    # the first hiccup. All four transient paths must simply skip the tick and
+    # let the firmware's own bounded-pulse timer coast the motors to a halt.
+    class _ExplodingDetector:
+        def infer(self, frame_bgr):
+            raise RuntimeError("simulated inference failure")
+
+        def best(self, detections, label):
+            return None
+
+    for label, frame, det, ts in (
+        ("missing frame", None, _FakeDetector([]), None),
+        ("empty frame", _FakeFrame(0, 0), _FakeDetector([]), None),
+        ("stale frame", FRAME, _FakeDetector([]), time.monotonic() - (FRAME_STALE_SEC + 5)),
+        ("inference error", FRAME, _ExplodingDetector(), None),
+    ):
+        robot = _FakeRobot()
+        policy = SoccerPolicy(robot)
+        policy.decide_and_act(frame, ENABLED_SENSORS, det, wall_unknown, hold_toggle=False, frame_ts=ts)
+        assert ("stop",) not in robot.calls, (
+            f"{label}: called stop(), which ends the run and requires a human BOOT press to recover. "
+            f"Return instead - bounded drive pulses auto-stop in firmware. Got {robot.calls}"
+        )
+        assert robot.calls == [], f"{label}: must not drive on bad vision either, got {robot.calls}"
+    print("  -> all four transient failures skip the tick without ending the session")
 
     print("[SELF-TEST] NEW: de-wedge - sustained confirmed pushes trigger one nudge, then resume pushing")
     robot = _FakeRobot()
