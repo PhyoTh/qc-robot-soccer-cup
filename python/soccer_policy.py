@@ -317,9 +317,41 @@ SCORING_LOST_WITHIN_TICKS = 4      # ball must vanish within this many ticks of 
 # exactly where the referee places the robot and how fast these motors move.
 # Tune it on the field: run it, watch where the robot ends up, adjust.
 # Set OPENING_SEQUENCE = [] to disable the opening entirely.
+# MEASURED FIELD GEOMETRY (given by the team, Aug 14):
+#   - strafing LEFT ~6 inches puts the robot in front of the goal
+#   - from there the ball sits ~15 inches directly ahead
+OPENING_LEFT_INCHES = 6.0
+OPENING_FORWARD_INCHES = 15.0
+
+# Speeds used for the opening burst. Higher = faster to the ball but less
+# accurate distance-per-ms; these are the values the MS_PER_INCH numbers
+# below must be calibrated AT.
+OPENING_STRAFE_SPEED = 200
+OPENING_FORWARD_SPEED = 220
+
+# CALIBRATE THESE ON THE FIELD - run: python3 python/calibrate_motion.py
+# Milliseconds of drive time per inch travelled, at the speeds above. The
+# defaults are placeholders derived from nothing; mecanum strafing is
+# typically slower per-inch than driving forward, which is why they differ.
+# Getting these right is the single highest-value tuning step for the
+# opening, because everything below is computed from them.
+STRAFE_MS_PER_INCH = 75.0
+FORWARD_MS_PER_INCH = 55.0
+
+# Stop short of the ball rather than driving through where it sits: the
+# normal closed-loop chase should make the final approach, and overshooting
+# risks knocking the ball somewhere random before we ever see it.
+OPENING_FORWARD_STOP_SHORT_INCHES = 4.0
+
 OPENING_SEQUENCE = [
-    ("left", 200, 450),     # strafe off the corner, onto the goal-to-goal line
-    ("forward", 220, 600),  # burst down that line toward the centre dot
+    # Strafe off the corner, onto the goal-to-goal line.
+    ("left", OPENING_STRAFE_SPEED, int(OPENING_LEFT_INCHES * STRAFE_MS_PER_INCH)),
+    # Burst down that line toward the ball, stopping short of it.
+    (
+        "forward",
+        OPENING_FORWARD_SPEED,
+        int(max(OPENING_FORWARD_INCHES - OPENING_FORWARD_STOP_SHORT_INCHES, 1) * FORWARD_MS_PER_INCH),
+    ),
 ]
 # Abort the opening if a "robot" detection is at least this wide - an opponent
 # charging the same spot. Bbox-only on purpose: the ultrasonic sensor is dead

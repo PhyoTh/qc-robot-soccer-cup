@@ -236,7 +236,17 @@ def main() -> None:
     print(f"health   : {robot.health()}")
     sensors = robot.read_sensors()
     print(f"sensors  : {sensors}")
-    print(f"[TEAM] active team: {'BLUE' if robot.hold_toggle() else 'RED'}  (hold CAM button 5s to switch)")
+    # The referee assigns red or blue PER ROUND and it can change between
+    # rounds, so this must be verified before every single game. It is what
+    # own-goal avoidance compares the field tape against - if it is wrong the
+    # robot will confidently attack its own net. Printed as a banner because
+    # it is the one setting that fails silently.
+    team = "BLUE" if robot.hold_toggle() else "RED"
+    print("=" * 58)
+    print(f"   TEAM = {team}     (onboard RGB: red=RED, blue=BLUE)")
+    print("   Wrong? HOLD the CAM button 5s to toggle, then re-run.")
+    print("   Check this before EVERY round - the ref can reassign it.")
+    print("=" * 58)
 
     if not sensors.get("line_ok"):
         print("[WARN] line sensor unavailable - precision course will not work, match play is unaffected")
