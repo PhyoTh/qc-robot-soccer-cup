@@ -272,6 +272,26 @@ DEWEDGE_MS = 200
 SEARCH_ESCALATE_AFTER_TICKS = 15
 SEARCH_WIDEN_EVERY_TICKS = 5
 
+# --- Goal-scored heuristic (drives the celebration) -------------------------
+# There is no score sensor, so "did we score?" has to be inferred. The signal
+# used is: we were pushing a CLOSE ball at a POSITIVELY CONFIRMED opponent
+# end, and then the ball disappeared. A ball that vanishes while being driven
+# into the opponent's goal mouth most likely went in.
+#
+# This is a heuristic and it WILL sometimes fire on an occlusion or a ball
+# that squirted sideways. That is an accepted trade: the cost of a false
+# celebration is a couple of wasted seconds, and the routine is bounded and
+# self-stopping. The cost of missing a real goal is no celebration at all,
+# which for the Redemption Cup's "Best Goal Celebration" is the entire
+# scoring criterion. Bias toward firing.
+#
+# Both numbers are unvalidated - tune on the field. If it celebrates when the
+# ball merely rolls out of view, raise SCORING_PUSH_MIN_SIZE_FRAC (demand the
+# ball be closer) or lower SCORING_LOST_WITHIN_TICKS (demand it vanish sooner
+# after the push).
+SCORING_PUSH_MIN_SIZE_FRAC = 0.12  # ball must fill >=12% of frame width to count as a scoring push
+SCORING_LOST_WITHIN_TICKS = 4      # ball must vanish within this many ticks of that push
+
 # --- Goal-side memory (design note 6) ---------------------------------------
 # Added live at the venue: the moment the robot is closest to actually
 # scoring - ball centred, close, right in front of the goal - is exactly the
@@ -354,8 +374,13 @@ class SoccerPolicy:
     ball tracker, and the search/scan alternation flags). Everything else is
     passed in fresh each call, per the Acquire/Reobserve loop."""
 
-    def __init__(self, robot: "MiniAutoRobot") -> None:
+    def __init__(self, robot: "MiniAutoRobot", on_goal_scored=None) -> None:
+        """on_goal_scored: optional zero-arg callback fired when the policy
+        believes it just scored (see _maybe_goal_scored). Used to trigger the
+        Redemption Cup celebration. Left None during normal bracket play -
+        celebrating mid-match burns clock for no points."""
         self.robot = robot
+        self.on_goal_scored = on_goal_scored
         self.reset()
 
     def reset(self) -> None:
@@ -375,6 +400,7 @@ class SoccerPolicy:
         self._consecutive_push_ticks = 0  # see DEWEDGE_PUSH_TICKS
         self._last_goal_side: Optional[str] = None  # see GOAL_MEMORY_TICKS
         self._last_goal_side_age = 0
+        self._ticks_since_scoring_push: Optional[int] = None  # see _maybe_goal_scored
 
     def decide_and_act(
         self,
@@ -424,6 +450,10 @@ class SoccerPolicy:
         raw_ball = self._above_threshold(detector.best(detections, "soccer_ball"))
         track_state = self._tracker.update(raw_ball)
 
+        # Age the goal-scored arm window (see _maybe_goal_scored).
+        if self._ticks_since_scoring_push is not None:
+            self._ticks_since_scoring_push += 1
+
         # 4) --- OPPONENT CONTACT: two tiers, checked before ball-chase ----
         # See design note 3: only genuinely imminent contact retreats;
         # ordinary contested closeness jukes around instead.
@@ -457,6 +487,8 @@ class SoccerPolicy:
         if track_state == "lost":
             self._possession_scan_ticks = 0
             self._consecutive_push_ticks = 0
+            # Check BEFORE clearing goal memory - the check reads it.
+            self._maybe_goal_scored()
             self._last_goal_side = None  # ball itself is gone, not just occluded - don't trust old goal memory
             if self._search_turn_left_next is None:
                 self._search_turn_left_next = self._tracker.last_known_side_left(frame_w)
@@ -577,6 +609,11 @@ class SoccerPolicy:
 
             size_frac = min(ball_w / frame_w, 1.0)
             speed = max(int(APPROACH_SPEED * (1.0 - size_frac)), MIN_APPROACH_SPEED)
+            # Arm goal detection: we are pushing a CLOSE ball at a CONFIRMED
+            # opponent end. If the ball vanishes shortly after this, the most
+            # likely explanation is that it went in. See _maybe_goal_scored.
+            if size_frac >= SCORING_PUSH_MIN_SIZE_FRAC:
+                self._ticks_since_scoring_push = 0
             print(f"[POLICY] ball centred (size_frac={size_frac:.2f}) - approaching opponent goal at speed={speed}")
             self.robot.drive("forward", speed=speed, ms=DRIVE_MS)
             return
@@ -603,6 +640,27 @@ class SoccerPolicy:
             f"(scan {self._possession_scan_ticks}/{POSSESSION_SCAN_GRACE_TICKS}) - peeking {direction}"
         )
         self.robot.drive(direction, speed=POSSESSION_SCAN_SPEED, ms=POSSESSION_SCAN_TURN_MS)
+
+    def _maybe_goal_scored(self) -> None:
+        """Fire on_goal_scored if the ball vanished right after we drove it,
+        close, at a confirmed opponent end. See the SCORING_* constants for
+        why this is deliberately biased toward firing.
+
+        Called from the ball-lost branch only, and always disarms afterwards
+        so one goal cannot trigger repeated celebrations.
+        """
+        armed = self._ticks_since_scoring_push
+        self._ticks_since_scoring_push = None  # disarm regardless of outcome
+        if armed is None or armed > SCORING_LOST_WITHIN_TICKS:
+            return
+        if self.on_goal_scored is None:
+            print(f"[POLICY] GOAL likely scored (ball vanished {armed} tick(s) after a close push)")
+            return
+        print(f"[POLICY] GOAL! (ball vanished {armed} tick(s) after a close push) - celebrating")
+        try:
+            self.on_goal_scored()
+        except Exception as exc:  # noqa: BLE001 - a failed celebration must never end the match
+            print(f"[WARN] celebration raised {exc!r} - continuing play")
 
     @staticmethod
     def _above_threshold(detection: Optional["Detection"]) -> Optional["Detection"]:
@@ -884,6 +942,43 @@ if __name__ == "__main__":
     disabled_sensors = {"program_enabled": False, "ultrasonic_mm": -1}
     policy.decide_and_act(FRAME, disabled_sensors, _FakeDetector([]), wall_unknown, hold_toggle=False)
     assert robot.calls == [], robot.calls
+
+    print("[SELF-TEST] NEW: goal-scored fires when a close ball vanishes at a confirmed opponent end")
+    fired = []
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot, on_goal_scored=lambda: fired.append(True))
+    close_ball = _FakeDetection("soccer_ball", 0.9, x=140, y=150, width=60, height=60)  # 19% of frame
+    opp_goal = _FakeDetection("goal", 0.9, x=100, y=20, width=120, height=60)
+    wall_opp = _FakeWallDetector("OPPONENT SIDE")
+    # Push at a confirmed opponent end with the ball close...
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball, opp_goal]), wall_opp, hold_toggle=False)
+    assert robot.calls[-1][1] == "forward", robot.calls
+    # ...then the ball vanishes. Coast window first, then genuinely lost.
+    for _ in range(COAST_TICKS + 1):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([]), wall_opp, hold_toggle=False)
+    assert fired, "expected the goal callback to fire when the ball vanished right after a close push"
+    print(f"  -> callback fired once ({len(fired)}x total)")
+
+    print("[SELF-TEST] NEW: goal-scored does NOT fire when the ball simply drifts away far from goal")
+    fired = []
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot, on_goal_scored=lambda: fired.append(True))
+    far_ball = _FakeDetection("soccer_ball", 0.9, x=152, y=150, width=15, height=15)  # 5% - too far to be a scoring push
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([far_ball, opp_goal]), wall_opp, hold_toggle=False)
+    for _ in range(COAST_TICKS + 1):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([]), wall_opp, hold_toggle=False)
+    assert not fired, "a distant ball going out of view is not a goal - must not celebrate"
+    print("  -> correctly stayed silent (ball was only 5% of frame, not a scoring push)")
+
+    print("[SELF-TEST] NEW: a celebration that raises must not end the match")
+    robot = _FakeRobot()
+    def _boom():
+        raise RuntimeError("celebration exploded")
+    policy = SoccerPolicy(robot, on_goal_scored=_boom)
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball, opp_goal]), wall_opp, hold_toggle=False)
+    for _ in range(COAST_TICKS + 1):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([]), wall_opp, hold_toggle=False)  # must not raise
+    print("  -> exception swallowed, play continued")
 
     print("[SELF-TEST] CRITICAL: a transient camera/inference failure must NEVER call stop()")
     # stop() sets program_enabled=false in firmware, ending the run until a
