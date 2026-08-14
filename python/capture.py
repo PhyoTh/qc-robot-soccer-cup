@@ -3,7 +3,7 @@ capture.py  -  image capture using Modulino buttons A / B / C.
 
 Button A (left)   : capture into  soccer_ball/  every 0.5 s while held
 Button B (middle) : capture into  robot/        every 0.5 s while held
-Button C (right)  : capture into  empty/        every 0.5 s while held
+Button C (right)  : capture into  goal/         every 0.5 s while held
 
 Hold any button to stream captures into that label folder.
 Release to stop. All three folders are created automatically.
@@ -11,7 +11,17 @@ Release to stop. All three folders are created automatically.
 Captured images are saved under:
   captures/soccer_ball/
   captures/robot/
-  captures/empty/
+  captures/goal/
+
+NOTE: button C was originally "empty" (background/negative examples).
+Repointed to "goal" at the venue - the goal class turned out to be the
+weak point of the trained model (both nano/192 and pico/160 struggle with
+it, especially with the ball positioned in front of the goal), and we
+already have a full set of empty/background captures from the original
+321-image dataset. Walk the camera around the REAL goal while holding this
+button: vary distance, angle, and - specifically - the ball's position in
+front of the goal, since that's the reported failure case. Aim for
+variety over volume; 30-50 well-varied shots beat 200 near-duplicates.
 """
 import base64
 import io, os, json
@@ -32,7 +42,7 @@ CAPTURES_FOLDER = PROJECT_FOLDER / "captures"
 LABELS = {
     "object_a_count": "soccer_ball",
     "object_b_count": "robot",
-    "object_c_count": "empty",
+    "object_c_count": "goal",  # repointed from "empty" at the venue - see module docstring
 }
 
 # How often to save a frame while a button is held (seconds)
