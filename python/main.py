@@ -42,6 +42,35 @@ CAMERA_WARMUP_RETRY_DELAY = 0.05
 MAX_MATCH_SECONDS = 6 * 60
 
 
+def _setting(name: str, default: str = "") -> str:
+    """Read a setting from the environment, falling back to a KEY=VALUE line
+    in <app root>/match_config.txt.
+
+    The file exists because App Lab's Run button may not offer a way to set
+    environment variables, and stopping the app to run things by hand is not
+    an option either - stopping it destroys the container that holds the
+    arduino runtime. So the file is the reliable channel: edit it from the
+    host, hit Run, done.
+    """
+    from_env = os.environ.get(name)
+    if from_env is not None and from_env.strip():
+        return from_env.strip()
+
+    config = APP_ROOT / "match_config.txt"
+    if config.is_file():
+        try:
+            for line in config.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                if key.strip().upper() == name.upper():
+                    return value.strip()
+        except OSError as exc:
+            print(f"[WARN] could not read {config}: {exc}")
+    return default
+
+
 def _ensure_edge_impulse() -> bool:
     """Install edge_impulse_linux from the bundled wheel if it's missing.
 
@@ -114,7 +143,7 @@ def run_match(robot, App, policy_class=None) -> None:
     from soccer_policy import SoccerPolicy
     from wall_detector import WallSideDetector
 
-    model_path = os.environ.get("EI_MODEL_PATH", DEFAULT_MODEL_PATH)
+    model_path = _setting("EI_MODEL_PATH", DEFAULT_MODEL_PATH)
     policy_class = policy_class or SoccerPolicy
 
     try:
@@ -139,7 +168,7 @@ def run_match(robot, App, policy_class=None) -> None:
             # celebrating burns match clock for no points, and a false
             # positive would do it while the ball is still live.
             on_goal = None
-            if os.environ.get("CELEBRATE", "").strip() in ("1", "true", "yes", "on"):
+            if _setting("CELEBRATE").lower() in ("1", "true", "yes", "on"):
                 from celebration import celebrate
                 on_goal = lambda: celebrate(robot, cycles=1)  # noqa: E731
                 print("[INFO] celebration ENABLED - will fire on a detected goal")
@@ -183,7 +212,7 @@ def run_vision(robot) -> None:
     import ei_runner
     from wall_detector import WallSideDetector
 
-    model_path = os.environ.get("EI_MODEL_PATH", DEFAULT_MODEL_PATH)
+    model_path = _setting("EI_MODEL_PATH", DEFAULT_MODEL_PATH)
     try:
         cap = _open_camera()
     except RuntimeError as exc:
@@ -223,7 +252,7 @@ def run_vision(robot) -> None:
 
 
 def main() -> None:
-    mode = os.environ.get("MODE", "match").strip().lower()
+    mode = _setting("MODE", "match").lower()
     print(f"[INFO] MODE={mode}")
 
     if mode in ("match", "vision", "trickshot", "fastball"):
@@ -252,7 +281,7 @@ def main() -> None:
     # burst strafes. Backwards means driving into the corner instead of onto
     # the goal line, so it is banner-printed alongside the team colour.
     import soccer_policy as _sp
-    corner = os.environ.get("START_CORNER", _sp.OPENING_START_CORNER).strip().lower()
+    corner = _setting("START_CORNER", _sp.OPENING_START_CORNER).lower()
     try:
         _sp.set_opening_corner(corner)
     except ValueError as exc:
@@ -286,6 +315,17 @@ def main() -> None:
             run_match(robot, App, policy_class=TrickShotPolicy)
         elif mode == "fastball":
             run_fastball(robot, App)
+        elif mode == "idle":
+            # Keeps the container alive while claiming NOTHING - no BOOT
+            # handler, no motors. Needed because stopping the App Lab app
+            # destroys the container, and the container is the only place
+            # arduino.app_utils exists. So to run something by hand (e.g.
+            # calibrate_motion.py) you leave the app running in idle and
+            # exec into it, instead of stopping it and losing the runtime.
+            print("[INFO] IDLE - container alive, BOOT button free for manual scripts.")
+            print("[INFO] docker exec -it miniautodriver-main-1 bash   then run what you want.")
+            while True:
+                time.sleep(3600)
         else:
             print(f"[FAIL] unknown MODE={mode!r} - see this file's docstring for valid values")
     finally:
@@ -297,7 +337,7 @@ def run_fastball(robot, App) -> None:
     import ei_runner
     from fastest_ball_detection import run_fastest_ball_detection
 
-    model_path = os.environ.get("EI_MODEL_PATH", DEFAULT_MODEL_PATH)
+    model_path = _setting("EI_MODEL_PATH", DEFAULT_MODEL_PATH)
     try:
         cap = _open_camera()
     except RuntimeError as exc:

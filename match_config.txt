@@ -1,0 +1,45 @@
+# Match settings, read by python/main.py at startup.
+#
+# WHY A FILE: App Lab's Run button may not let you set environment variables,
+# and you cannot just stop the app and run things by hand instead - stopping
+# it destroys the container that holds the arduino runtime. So edit this file
+# from the host, then hit Run.
+#
+# Environment variables still win if set, e.g.:
+#   MODE=vision python3 python/main.py
+#
+# Edit on the robot with:
+#   nano ~/ArduinoApps/miniautodriver/match_config.txt
+
+# ---------------------------------------------------------------------------
+# MODE - what Run does
+#   match      autonomous soccer (use this for real games)
+#   idle       container stays up, BOOT button left free for manual scripts
+#              (use this when running calibrate_motion.py / test_vision.py)
+#   vision     print detections only, never moves the motors
+#   demo       original hardware bring-up demo
+#   celebrate / course / trickshot / fastball   Redemption Cup challenges
+# ---------------------------------------------------------------------------
+MODE=match
+
+# ---------------------------------------------------------------------------
+# START_CORNER - which corner the referee placed us in. Decides which way the
+# kickoff burst strafes. WRONG VALUE DRIVES INTO THE CORNER instead of onto
+# the goal line, so check it every round. Values: right | left
+# ---------------------------------------------------------------------------
+START_CORNER=right
+
+# ---------------------------------------------------------------------------
+# CELEBRATE - fire the goal celebration when the policy thinks it scored.
+# Leave 0 for bracket play: celebrating burns match clock for no points, and
+# a false positive would do it while the ball is still live. Set 1 for the
+# Redemption Cup "Best Goal Celebration" challenge.
+# ---------------------------------------------------------------------------
+CELEBRATE=0
+
+# ---------------------------------------------------------------------------
+# EI_MODEL_PATH - which exported model to load.
+#   models/pico-160.eim   faster  (26ms)   mAP@50 0.91
+#   models/nano-192.eim   sharper (118ms)  mAP@50 0.94
+# ---------------------------------------------------------------------------
+EI_MODEL_PATH=models/pico-160.eim
