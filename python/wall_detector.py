@@ -86,7 +86,8 @@ class WallSideDetector:
         self,
         sat_min: int = 120,
         val_min: int = 70,
-        min_tape_px: int = 50,
+        min_tape_px: int = 250,
+        dominance_ratio: float = 6.0,
         band_top_frac: float = BAND_TOP_FRAC,
         band_bottom_frac: float = BAND_BOTTOM_FRAC,
     ) -> None:
@@ -98,6 +99,19 @@ class WallSideDetector:
         # on real venue frames the correct colour came in at 0.17%-2.29% of
         # frame, i.e. below or barely above the old 2.0% floor.
         self.min_tape_px = min_tape_px
+        # When one colour outnumbers the other by at least this factor, decide
+        # on AREA and skip the centroid comparison entirely. Measured on the
+        # field Aug 14: parked facing the blue goal, blue read ~1300px at
+        # offset ~100px while red read only ~90px of scattered noise that
+        # happened to sit near frame centre - and the centroid rule handed the
+        # verdict to that noise, flipping RED/BLUE ~20 times while the robot
+        # sat perfectly still. Centroid is the right operator only when BOTH
+        # colours are genuinely present (the case Victor measured); when one
+        # is 6x+ the other, the big one is the real tape and the small one is
+        # speckle. This guard is deliberately narrow so it cannot touch the
+        # 18,685px-vs-5,008px case (ratio 3.7) that motivated the centroid
+        # rule in the first place.
+        self.dominance_ratio = dominance_ratio
         self.band_top_frac = band_top_frac
         self.band_bottom_frac = band_bottom_frac
 
@@ -160,9 +174,15 @@ class WallSideDetector:
             side = "RED"
         elif not red_seen:
             side = "BLUE"
+        elif red_px >= blue_px * self.dominance_ratio:
+            # Overwhelming area difference - see dominance_ratio in __init__.
+            side = "RED"
+        elif blue_px >= red_px * self.dominance_ratio:
+            side = "BLUE"
         else:
-            # Both visible - the one nearer frame centre is nearer the
-            # vanishing point, i.e. the far end, i.e. the one we're facing.
+            # Both genuinely present in comparable amounts - the one nearer
+            # frame centre is nearer the vanishing point, i.e. the far end,
+            # i.e. the one we're facing.
             side = "RED" if red_offset < blue_offset else "BLUE"
 
         return {
@@ -284,6 +304,26 @@ if __name__ == "__main__":
         f"expected RED (nearer centre) despite BLUE having more pixels - got {analysis['side']}"
     )
     print(f"  -> RED, despite BLUE having {analysis['blue_px']}px vs {analysis['red_px']}px")
+
+    print("[SELF-TEST] NEW REGRESSION: a small speck near centre must NOT outvote a big band of the other colour")
+    # Reproduces the failure seen on the field Aug 14: parked facing the blue
+    # goal, blue read ~1300px at offset ~100px while red was ~90px of speckle
+    # sitting near frame centre. The centroid rule handed the verdict to the
+    # speckle and the answer flipped RED/BLUE ~20 times while the robot sat
+    # still. Big honest band of blue at the EDGE, tiny red speck at CENTRE.
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    blue_bgr = cv2.cvtColor(np.uint8([[[115, 220, 200]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    red_bgr = cv2.cvtColor(np.uint8([[[5, 220, 200]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    frame[int(240 * 0.25):int(240 * 0.50), 250:310] = blue_bgr   # 60x60 = 3600px, far right
+    frame[int(240 * 0.30):int(240 * 0.34), 155:170] = red_bgr    # ~9x15 = 135px, dead centre
+    analysis = detector.analyze(frame)
+    print(detector.diagnostic_line(analysis))
+    assert analysis["blue_px"] > analysis["red_px"] * 6, "test setup: blue must dominate by >6x"
+    assert analysis["side"] == "BLUE", (
+        f"a {analysis['red_px']}px red speck near centre must not outvote {analysis['blue_px']}px "
+        f"of real blue tape - got {analysis['side']}. This is the field bug the dominance guard fixes."
+    )
+    print(f"  -> BLUE ({analysis['blue_px']}px) correctly beat the {analysis['red_px']}px centre speck")
 
     print("[SELF-TEST] only one colour visible -> that colour, no centroid comparison needed")
     frame = np.zeros((240, 320, 3), dtype=np.uint8)
