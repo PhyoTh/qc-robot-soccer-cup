@@ -72,6 +72,34 @@ BLUE_HUE_RANGE = (100, 130)
 BAND_TOP_FRAC = 0.20
 BAND_BOTTOM_FRAC = 0.60
 
+# Connected components smaller than this many pixels are discarded from the
+# colour masks before anything is counted. This fixes a REAL bug seen on the
+# robot: facing the blue end, the verdict alternated between BLUE and RED
+# frame to frame.
+#
+# Cause: the venue's walls are very dark (median brightness ~29 - the camera
+# meters for the bright floor), and sensor noise on near-black pixels lands
+# near hue 0, which is inside RED_HUE_RANGES. So a frame containing genuinely
+# ZERO red tape still produces scattered red specks. Once that speck count
+# clears min_tape_px, the centroid comparison starts running against a phantom
+# whose centroid is essentially random - and a random centroid beats real tape
+# about half the time. Measured on "blue goal from blue.png": clean frame has
+# red_px=0 and reads BLUE every time; with mild sensor noise red_px=46 and it
+# read RED on 33 of 40 trials, purely from noise.
+#
+# Filtering by COMPONENT SIZE rather than by morphological opening matters
+# here. An open (even a 3x3) erodes the real tape too, and at distance the far
+# tape is already fragmented - in "red goal from blue.png" the whole red run is
+# 110px split across 14 components, largest only 38px. A 3x3 open erased it and
+# flipped that frame to the wrong answer. Noise specks are 1-3px, so a size
+# filter separates them cleanly without touching real (if small) tape.
+#
+# Swept against the labelled venue frames: 8-15 all scored 5/5 clean AND 5/5
+# stable under simulated sensor noise. Below 8 the flicker returns; at 20+ real
+# distant tape starts being discarded. 10 sits in the middle of that plateau.
+# Set to 0 or 1 to disable.
+MIN_COMPONENT_PX = 10
+
 
 def _require_cv() -> None:
     if _CV_IMPORT_ERROR is not None:
@@ -89,6 +117,7 @@ class WallSideDetector:
         min_tape_px: int = 250,
         band_top_frac: float = BAND_TOP_FRAC,
         band_bottom_frac: float = BAND_BOTTOM_FRAC,
+        min_component_px: int = MIN_COMPONENT_PX,
     ) -> None:
         self.sat_min = sat_min
         self.val_min = val_min
@@ -110,22 +139,66 @@ class WallSideDetector:
         # while genuine far tape measured 1300px+.
         self.band_top_frac = band_top_frac
         self.band_bottom_frac = band_bottom_frac
+        self.min_component_px = min_component_px
+        # Preallocated HSV bounds - analyze() runs on every tick that reaches
+        # the policy's scoring decision, so avoid rebuilding six small numpy
+        # arrays per call. Mutated in place by _masks(); not thread-safe, which
+        # is fine - the policy loop is single-threaded by construction.
+        if np is not None:
+            (r0_lo, r0_hi), (r1_lo, r1_hi) = RED_HUE_RANGES
+            b_lo, b_hi = BLUE_HUE_RANGE
+            self._lo = np.array([0, sat_min, val_min], dtype=np.uint8)
+            self._hi = np.array([0, 255, 255], dtype=np.uint8)
+            self._hue_bounds = ((r0_lo, r0_hi), (r1_lo, r1_hi), (b_lo, b_hi))
+            self._col_idx = None  # lazily sized to frame width, reused after
 
     def _masks(self, hsv):
-        lo_sv = np.array([0, self.sat_min, self.val_min])
-        hi_sv = np.array([0, 255, 255])
+        """Red/blue masks for an already-cropped HSV band. Mutates the
+        preallocated bound arrays in place rather than rebuilding them."""
+        lo, hi = self._lo, self._hi
+        (r0_lo, r0_hi), (r1_lo, r1_hi), (b_lo, b_hi) = self._hue_bounds
 
-        (r0_lo, r0_hi), (r1_lo, r1_hi) = RED_HUE_RANGES
-        lo_sv[0], hi_sv[0] = r0_lo, r0_hi
-        red_mask_a = cv2.inRange(hsv, lo_sv, hi_sv)
-        lo_sv[0], hi_sv[0] = r1_lo, r1_hi
-        red_mask_b = cv2.inRange(hsv, lo_sv, hi_sv)
-        red_mask = cv2.bitwise_or(red_mask_a, red_mask_b)
+        lo[0], hi[0] = r0_lo, r0_hi
+        red_mask = cv2.inRange(hsv, lo, hi)
+        lo[0], hi[0] = r1_lo, r1_hi
+        # in-place OR into red_mask - saves allocating a third mask per call
+        cv2.bitwise_or(red_mask, cv2.inRange(hsv, lo, hi), dst=red_mask)
 
-        b_lo, b_hi = BLUE_HUE_RANGE
-        lo_sv[0], hi_sv[0] = b_lo, b_hi
-        blue_mask = cv2.inRange(hsv, lo_sv, hi_sv)
-        return red_mask, blue_mask
+        lo[0], hi[0] = b_lo, b_hi
+        blue_mask = cv2.inRange(hsv, lo, hi)
+
+        # Drop speckle before anything is counted - see MIN_COMPONENT_PX.
+        return self._drop_small(red_mask), self._drop_small(blue_mask)
+
+    def _drop_small(self, mask):
+        """Zero out connected components below min_component_px. Sensor noise
+        on the venue's near-black walls reads as 1-3px red specks; real tape is
+        a contiguous run even when distant and fragmented."""
+        if self.min_component_px <= 1:
+            return mask
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        if count <= 1:
+            return mask
+        keep = (stats[:, cv2.CC_STAT_AREA] >= self.min_component_px).astype(np.uint8) * 255
+        keep[0] = 0  # component 0 is always the background
+        return keep[labels]
+
+    def _column_stats(self, mask, w: int):
+        """(pixel count, horizontal centroid) for a 0/255 mask.
+
+        Deliberately avoids np.nonzero(), which materialises one int64 index
+        array per matched pixel - on a frame with a lot of tape that is the
+        single biggest allocation in this function. Summing down columns
+        first collapses the work to O(width) and keeps it inside OpenCV."""
+        col = cv2.reduce(mask, 0, cv2.REDUCE_SUM, dtype=cv2.CV_32S).reshape(-1)
+        total = int(col.sum())
+        if total == 0:
+            return 0, None
+        if self._col_idx is None or self._col_idx.shape[0] != w:
+            self._col_idx = np.arange(w, dtype=np.float64)
+        # The 255 scaling cancels in the weighted mean, so no need to divide it out.
+        centroid = float(col.dot(self._col_idx) / total)
+        return total // 255, centroid
 
     def analyze(self, frame_bgr) -> dict:
         """Decide which end of the field the camera faces. See the module
@@ -139,28 +212,31 @@ class WallSideDetector:
         if frame_bgr is None or frame_bgr.size == 0:
             return empty
 
-        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        h, w = hsv.shape[0], hsv.shape[1]
+        h, w = frame_bgr.shape[0], frame_bgr.shape[1]
         if h == 0 or w == 0:
             return empty
 
-        red_mask, blue_mask = self._masks(hsv)
-
-        # Restrict the decision to the wall band - ceiling and floor carry no
-        # tape and only add noise. Guard against a degenerate band on very
-        # short frames (the synthetic self-test frames below are 40px tall).
+        # Crop to the wall band BEFORE any per-pixel work. Ceiling and floor
+        # carry no tape, so converting and thresholding them is pure waste -
+        # and with the default 20-60% band that is 60% of the frame skipped
+        # in both cvtColor and inRange, the two dominant costs here. Slicing a
+        # numpy array is a view, so the crop itself is free.
+        # Guard against a degenerate band on very short frames (the synthetic
+        # self-test frames below are 40px tall).
         y0 = min(int(h * self.band_top_frac), max(h - 1, 0))
         y1 = max(int(h * self.band_bottom_frac), y0 + 1)
-        red_band, blue_band = red_mask[y0:y1], blue_mask[y0:y1]
+        band_bgr = frame_bgr[y0:y1]
+
+        hsv = cv2.cvtColor(band_bgr, cv2.COLOR_BGR2HSV)
+        red_band, blue_band = self._masks(hsv)
 
         band_px = red_band.shape[0] * red_band.shape[1]
-        red_xs = np.nonzero(red_band)[1]
-        blue_xs = np.nonzero(blue_band)[1]
-        red_px, blue_px = int(red_xs.size), int(blue_xs.size)
+        red_px, red_cx = self._column_stats(red_band, w)
+        blue_px, blue_cx = self._column_stats(blue_band, w)
 
         center_x = w / 2.0
-        red_offset = float(abs(red_xs.mean() - center_x)) if red_px else None
-        blue_offset = float(abs(blue_xs.mean() - center_x)) if blue_px else None
+        red_offset = abs(red_cx - center_x) if red_cx is not None else None
+        blue_offset = abs(blue_cx - center_x) if blue_cx is not None else None
 
         red_seen = red_px >= self.min_tape_px
         blue_seen = blue_px >= self.min_tape_px
@@ -349,6 +425,42 @@ if __name__ == "__main__":
     assert analysis["side"] == "BLUE", f"expected BLUE, got {analysis['side']}"
     assert analysis["red_px"] < detector.min_tape_px, "no red should be visible here"
     print(f"  -> {analysis['side']}  (blue_px={analysis['blue_px']}, red_px={analysis['red_px']})")
+
+    # --- Regression for the flicker seen on the robot (see MIN_COMPONENT_PX) ---
+    # Real blue tape as one solid blob, plus scattered single-pixel red specks
+    # of the kind sensor noise produces on the venue's near-black walls. The
+    # specks are deliberately placed NEARER frame centre than the real tape, so
+    # if they are counted at all they WIN the centroid comparison and the
+    # verdict flips to RED - which is exactly what the robot was doing.
+    print("[SELF-TEST] REGRESSION: scattered red speckle must not outvote a solid blue blob")
+    frame = np.zeros((240, 320, 3), dtype=np.uint8)
+    blue_bgr = cv2.cvtColor(np.uint8([[[115, 220, 200]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    red_bgr = cv2.cvtColor(np.uint8([[[5, 220, 200]]]), cv2.COLOR_HSV2BGR)[0, 0]
+    frame[80:110, 230:300] = blue_bgr           # solid real tape, off to one side
+    rng = np.random.default_rng(0)
+    for _ in range(400):                         # speckle clustered near frame centre
+        sy = int(rng.integers(60, 130))
+        sx = int(rng.integers(140, 180))
+        frame[sy, sx] = red_bgr
+    analysis = detector.analyze(frame)
+    print(detector.diagnostic_line(analysis))
+    assert analysis["side"] == "BLUE", (
+        f"speckle outvoted real tape - the robot's BLUE/RED flicker is back. got {analysis['side']}\n"
+        f"  red_px={analysis['red_px']} blue_px={analysis['blue_px']}"
+    )
+    assert analysis["red_px"] < detector.min_tape_px, (
+        f"expected the speckle to be filtered out entirely, got red_px={analysis['red_px']}"
+    )
+    print(f"  -> BLUE, speckle filtered to red_px={analysis['red_px']} (blue_px={analysis['blue_px']})")
+
+    print("[SELF-TEST] ...and with the filter disabled, that same frame DOES flip (proves the test bites)")
+    unfiltered = WallSideDetector(min_component_px=0)
+    flipped = unfiltered.analyze(frame)
+    assert flipped["side"] == "RED", (
+        "the regression frame no longer reproduces the bug - it isn't testing anything. "
+        f"got {flipped['side']} with red_px={flipped['red_px']}"
+    )
+    print(f"  -> RED without the filter (red_px={flipped['red_px']}) - the frame genuinely reproduces it")
 
     print("[SELF-TEST] tape present but only in the ceiling/floor, outside the wall band -> UNKNOWN")
     frame = np.zeros((240, 320, 3), dtype=np.uint8)
