@@ -71,9 +71,10 @@ class TrickShotPolicy:
     """Wraps a real SoccerPolicy and intercepts only the obstacle-dodge
     decision; every other tick is delegated to the inner policy unchanged."""
 
-    def __init__(self, robot: "MiniAutoRobot") -> None:
+    def __init__(self, robot: "MiniAutoRobot", on_goal_scored=None) -> None:
+        # Signature mirrors SoccerPolicy so main.py can swap the two freely.
         self.robot = robot
-        self._policy = SoccerPolicy(robot)
+        self._policy = SoccerPolicy(robot, on_goal_scored=on_goal_scored)
         self._dodge_left_next = True  # alternates left/right dodge, same idea as SoccerPolicy's search alternation
 
     def reset(self) -> None:

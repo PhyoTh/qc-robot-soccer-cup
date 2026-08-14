@@ -272,6 +272,96 @@ DEWEDGE_MS = 200
 SEARCH_ESCALATE_AFTER_TICKS = 15
 SEARCH_WIDEN_EVERY_TICKS = 5
 
+# --- Goal-scored heuristic (drives the celebration) -------------------------
+# There is no score sensor, so "did we score?" has to be inferred. The signal
+# used is: we were pushing a CLOSE ball at a POSITIVELY CONFIRMED opponent
+# end, and then the ball disappeared. A ball that vanishes while being driven
+# into the opponent's goal mouth most likely went in.
+#
+# This is a heuristic and it WILL sometimes fire on an occlusion or a ball
+# that squirted sideways. That is an accepted trade: the cost of a false
+# celebration is a couple of wasted seconds, and the routine is bounded and
+# self-stopping. The cost of missing a real goal is no celebration at all,
+# which for the Redemption Cup's "Best Goal Celebration" is the entire
+# scoring criterion. Bias toward firing.
+#
+# Both numbers are unvalidated - tune on the field. If it celebrates when the
+# ball merely rolls out of view, raise SCORING_PUSH_MIN_SIZE_FRAC (demand the
+# ball be closer) or lower SCORING_LOST_WITHIN_TICKS (demand it vanish sooner
+# after the push).
+SCORING_PUSH_MIN_SIZE_FRAC = 0.12  # ball must fill >=12% of frame width to count as a scoring push
+SCORING_LOST_WITHIN_TICKS = 4      # ball must vanish within this many ticks of that push
+
+# --- Kickoff opening move ---------------------------------------------------
+# At kickoff the geometry is KNOWN, which is rare and worth exploiting: the
+# ball sits on the centre dot, and our robot starts behind the black line in
+# the RIGHT-HAND corner in front of our own goal. Strafing left lines us up
+# with the goal-to-goal axis (and the ball); driving forward then closes on
+# the ball down that line.
+#
+# Why bother instead of just letting the normal chase run: the model is
+# weakest on small distant objects (measured 0.50-0.72 on a ball at only 4-6%
+# of frame width), so at kickoff range detection is unreliable. Physically
+# closing the distance turns a hard perception problem into an easy one, and
+# whoever reaches the ball first controls the match. This is open-loop by
+# design - it does not wait to SEE the ball before moving, because waiting is
+# the thing that loses the race.
+#
+# It yields early on either of two conditions (see _run_opening): the ball is
+# already detected and roughly centred (chase it properly instead), or an
+# opponent looms large in frame (their kickoff burst is on a collision course
+# with ours - hand over to the normal policy, which jukes rather than rams;
+# tipping an opponent is a Yellow Card).
+#
+# EVERY VALUE HERE IS UNVALIDATED - the correct strafe duration depends on
+# exactly where the referee places the robot and how fast these motors move.
+# Tune it on the field: run it, watch where the robot ends up, adjust.
+# Set OPENING_SEQUENCE = [] to disable the opening entirely.
+# MEASURED FIELD GEOMETRY (given by the team, Aug 14):
+#   - strafing LEFT ~6 inches puts the robot in front of the goal
+#   - from there the ball sits ~15 inches directly ahead
+OPENING_LEFT_INCHES = 6.0
+OPENING_FORWARD_INCHES = 15.0
+
+# Speeds used for the opening burst. Higher = faster to the ball but less
+# accurate distance-per-ms; these are the values the MS_PER_INCH numbers
+# below must be calibrated AT.
+OPENING_STRAFE_SPEED = 200
+OPENING_FORWARD_SPEED = 220
+
+# CALIBRATE THESE ON THE FIELD - run: python3 python/calibrate_motion.py
+# Milliseconds of drive time per inch travelled, at the speeds above. The
+# defaults are placeholders derived from nothing; mecanum strafing is
+# typically slower per-inch than driving forward, which is why they differ.
+# Getting these right is the single highest-value tuning step for the
+# opening, because everything below is computed from them.
+STRAFE_MS_PER_INCH = 75.0
+FORWARD_MS_PER_INCH = 55.0
+
+# Stop short of the ball rather than driving through where it sits: the
+# normal closed-loop chase should make the final approach, and overshooting
+# risks knocking the ball somewhere random before we ever see it.
+OPENING_FORWARD_STOP_SHORT_INCHES = 4.0
+
+OPENING_SEQUENCE = [
+    # Strafe off the corner, onto the goal-to-goal line.
+    ("left", OPENING_STRAFE_SPEED, int(OPENING_LEFT_INCHES * STRAFE_MS_PER_INCH)),
+    # Burst down that line toward the ball, stopping short of it.
+    (
+        "forward",
+        OPENING_FORWARD_SPEED,
+        int(max(OPENING_FORWARD_INCHES - OPENING_FORWARD_STOP_SHORT_INCHES, 1) * FORWARD_MS_PER_INCH),
+    ),
+]
+# Abort the opening if a "robot" detection is at least this wide - an opponent
+# charging the same spot. Bbox-only on purpose: the ultrasonic sensor is dead
+# on this chassis, so proximity has to come from the camera.
+OPENING_ABORT_ON_OPPONENT_WIDTH_FRAC = 0.30
+# NOTE: the opening also yields the instant the ball is detected AT ALL, at
+# any offset - see _run_opening. No threshold for that on purpose: this burst
+# exists only to cover the window where the ball is too far to see, so any
+# real sighting makes closed-loop chasing the better move.
+
 # --- Goal-side memory (design note 6) ---------------------------------------
 # Added live at the venue: the moment the robot is closest to actually
 # scoring - ball centred, close, right in front of the goal - is exactly the
@@ -354,8 +444,13 @@ class SoccerPolicy:
     ball tracker, and the search/scan alternation flags). Everything else is
     passed in fresh each call, per the Acquire/Reobserve loop."""
 
-    def __init__(self, robot: "MiniAutoRobot") -> None:
+    def __init__(self, robot: "MiniAutoRobot", on_goal_scored=None) -> None:
+        """on_goal_scored: optional zero-arg callback fired when the policy
+        believes it just scored (see _maybe_goal_scored). Used to trigger the
+        Redemption Cup celebration. Left None during normal bracket play -
+        celebrating mid-match burns clock for no points."""
         self.robot = robot
+        self.on_goal_scored = on_goal_scored
         self.reset()
 
     def reset(self) -> None:
@@ -375,6 +470,11 @@ class SoccerPolicy:
         self._consecutive_push_ticks = 0  # see DEWEDGE_PUSH_TICKS
         self._last_goal_side: Optional[str] = None  # see GOAL_MEMORY_TICKS
         self._last_goal_side_age = 0
+        self._ticks_since_scoring_push: Optional[int] = None  # see _maybe_goal_scored
+        # Kickoff opening. Reset per session on purpose: after a Yellow Card
+        # both robots go back to starting position, so the opening applies
+        # again on the restart exactly as it did at kickoff.
+        self._opening_step = 0
 
     def decide_and_act(
         self,
@@ -424,6 +524,10 @@ class SoccerPolicy:
         raw_ball = self._above_threshold(detector.best(detections, "soccer_ball"))
         track_state = self._tracker.update(raw_ball)
 
+        # Age the goal-scored arm window (see _maybe_goal_scored).
+        if self._ticks_since_scoring_push is not None:
+            self._ticks_since_scoring_push += 1
+
         # 4) --- OPPONENT CONTACT: two tiers, checked before ball-chase ----
         # See design note 3: only genuinely imminent contact retreats;
         # ordinary contested closeness jukes around instead.
@@ -453,10 +557,20 @@ class SoccerPolicy:
                 self.robot.drive(juke_direction, speed=APPROACH_SPEED, ms=TURN_MS)
                 return
 
+        # 4.5) --- KICKOFF OPENING -----------------------------------------
+        # Runs AFTER the opponent-contact tiers above so safety always wins,
+        # and BEFORE ball chase because at kickoff the ball is usually too far
+        # to detect reliably - the whole point is to close that distance.
+        if self._opening_step < len(OPENING_SEQUENCE):
+            if self._run_opening(raw_ball, opponent, frame_w):
+                return
+
         # 5) --- BALL CHASE: tracking / coasting / lost ---------------------
         if track_state == "lost":
             self._possession_scan_ticks = 0
             self._consecutive_push_ticks = 0
+            # Check BEFORE clearing goal memory - the check reads it.
+            self._maybe_goal_scored()
             self._last_goal_side = None  # ball itself is gone, not just occluded - don't trust old goal memory
             if self._search_turn_left_next is None:
                 self._search_turn_left_next = self._tracker.last_known_side_left(frame_w)
@@ -577,6 +691,11 @@ class SoccerPolicy:
 
             size_frac = min(ball_w / frame_w, 1.0)
             speed = max(int(APPROACH_SPEED * (1.0 - size_frac)), MIN_APPROACH_SPEED)
+            # Arm goal detection: we are pushing a CLOSE ball at a CONFIRMED
+            # opponent end. If the ball vanishes shortly after this, the most
+            # likely explanation is that it went in. See _maybe_goal_scored.
+            if size_frac >= SCORING_PUSH_MIN_SIZE_FRAC:
+                self._ticks_since_scoring_push = 0
             print(f"[POLICY] ball centred (size_frac={size_frac:.2f}) - approaching opponent goal at speed={speed}")
             self.robot.drive("forward", speed=speed, ms=DRIVE_MS)
             return
@@ -603,6 +722,67 @@ class SoccerPolicy:
             f"(scan {self._possession_scan_ticks}/{POSSESSION_SCAN_GRACE_TICKS}) - peeking {direction}"
         )
         self.robot.drive(direction, speed=POSSESSION_SCAN_SPEED, ms=POSSESSION_SCAN_TURN_MS)
+
+    def _run_opening(self, raw_ball, opponent, frame_w: float) -> bool:
+        """Execute one step of the kickoff opening. Returns True if it acted
+        (caller should return), False to fall through to normal play.
+
+        Yields early - abandoning the rest of the sequence - when continuing
+        would be worse than playing normally. See OPENING_SEQUENCE.
+        """
+        # An opponent filling the frame means their kickoff burst is heading
+        # into ours. Hand over: the normal policy jukes around contact rather
+        # than driving through it, and tipping an opponent is a Yellow Card.
+        if opponent is not None and (opponent.width / frame_w) >= OPENING_ABORT_ON_OPPONENT_WIDTH_FRAC:
+            print(
+                f"[OPENING] aborted at step {self._opening_step + 1}/{len(OPENING_SEQUENCE)} - "
+                f"opponent fills {opponent.width / frame_w:.0%} of frame, playing it normally"
+            )
+            self._opening_step = len(OPENING_SEQUENCE)
+            return False
+
+        # We can SEE the ball - abandon the opening immediately. The entire
+        # reason this open-loop burst exists is that the ball is usually too
+        # far to detect at kickoff; the moment that stops being true, a real
+        # closed-loop chase is strictly better than continuing to guess.
+        if raw_ball is not None:
+            offset = raw_ball.center_x - frame_w / 2.0
+            print(
+                f"[OPENING] ball detected (off={offset:+.0f}px) at step "
+                f"{self._opening_step + 1}/{len(OPENING_SEQUENCE)} - switching to normal chase"
+            )
+            self._opening_step = len(OPENING_SEQUENCE)
+            return False
+
+        direction, speed, ms = OPENING_SEQUENCE[self._opening_step]
+        self._opening_step += 1
+        print(
+            f"[OPENING] step {self._opening_step}/{len(OPENING_SEQUENCE)}: "
+            f"{direction} speed={speed} ms={ms}"
+        )
+        self.robot.drive(direction, speed=speed, ms=ms)
+        return True
+
+    def _maybe_goal_scored(self) -> None:
+        """Fire on_goal_scored if the ball vanished right after we drove it,
+        close, at a confirmed opponent end. See the SCORING_* constants for
+        why this is deliberately biased toward firing.
+
+        Called from the ball-lost branch only, and always disarms afterwards
+        so one goal cannot trigger repeated celebrations.
+        """
+        armed = self._ticks_since_scoring_push
+        self._ticks_since_scoring_push = None  # disarm regardless of outcome
+        if armed is None or armed > SCORING_LOST_WITHIN_TICKS:
+            return
+        if self.on_goal_scored is None:
+            print(f"[POLICY] GOAL likely scored (ball vanished {armed} tick(s) after a close push)")
+            return
+        print(f"[POLICY] GOAL! (ball vanished {armed} tick(s) after a close push) - celebrating")
+        try:
+            self.on_goal_scored()
+        except Exception as exc:  # noqa: BLE001 - a failed celebration must never end the match
+            print(f"[WARN] celebration raised {exc!r} - continuing play")
 
     @staticmethod
     def _above_threshold(detection: Optional["Detection"]) -> Optional["Detection"]:
@@ -871,10 +1051,17 @@ if __name__ == "__main__":
     print("[SELF-TEST] no ball detected at all (never seen) -> search, arbitrary default side")
     robot = _FakeRobot()
     policy = SoccerPolicy(robot)
+    # Skip past the kickoff opening - this test is about SEARCH alternation.
+    # Without this it silently measures the opening's steps instead (which
+    # also differ from each other) and stops testing what it claims to.
+    policy._opening_step = len(OPENING_SEQUENCE)
     detector = _FakeDetector([])
     policy.decide_and_act(FRAME, ENABLED_SENSORS, detector, wall_unknown, hold_toggle=False)
     policy.decide_and_act(FRAME, ENABLED_SENSORS, detector, wall_unknown, hold_toggle=False)
     first_dir, second_dir = robot.calls[0][1], robot.calls[1][1]
+    assert first_dir.startswith("rotate") and second_dir.startswith("rotate"), (
+        f"expected two search rotations, got {robot.calls}"
+    )
     assert first_dir != second_dir, robot.calls
     print(f"  -> {first_dir} then {second_dir}  (alternates so it doesn't spin one way forever)")
 
@@ -884,6 +1071,93 @@ if __name__ == "__main__":
     disabled_sensors = {"program_enabled": False, "ultrasonic_mm": -1}
     policy.decide_and_act(FRAME, disabled_sensors, _FakeDetector([]), wall_unknown, hold_toggle=False)
     assert robot.calls == [], robot.calls
+
+    print("[SELF-TEST] NEW: kickoff opening runs its sequence, then hands over to normal play")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    empty_det = _FakeDetector([])
+    for i, (direction, speed, ms) in enumerate(OPENING_SEQUENCE):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, empty_det, wall_unknown, hold_toggle=False)
+        assert robot.calls[-1] == ("drive", direction, speed, ms), (
+            f"opening step {i + 1} should be {direction}, got {robot.calls[-1]}"
+        )
+    # Sequence exhausted -> normal policy (no ball anywhere -> search)
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, empty_det, wall_unknown, hold_toggle=False)
+    assert robot.calls[-1][1].startswith("rotate"), (
+        f"after the opening the normal search should take over, got {robot.calls[-1]}"
+    )
+    print(f"  -> ran {len(OPENING_SEQUENCE)} opening step(s), then normal search")
+
+    print("[SELF-TEST] NEW: opening ABORTS if an opponent is charging the same spot (collision risk)")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    big_opponent = _FakeDetection("robot", 0.9, x=40, y=20, width=140, height=120)  # 44% of frame
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([big_opponent]), wall_unknown, hold_toggle=False)
+    assert not [c for c in robot.calls if c[1] in ("left", "forward") and c[3] > 400], (
+        f"must not blindly burst into a looming opponent, got {robot.calls}"
+    )
+    assert policy._opening_step >= len(OPENING_SEQUENCE), "opening should be abandoned, not merely paused"
+    print(f"  -> aborted the burst and played normally: {robot.calls[-1]}")
+
+    print("[SELF-TEST] NEW: opening yields early once the ball is already centred")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    centred_ball = _FakeDetection("soccer_ball", 0.9, x=150, y=150, width=20, height=20)  # centre_x=160
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([centred_ball]), wall_unknown, hold_toggle=False)
+    assert policy._opening_step >= len(OPENING_SEQUENCE), "should abandon the opening once the ball is in view"
+    # Compare against the opening's exact (direction, speed, ms) - checking the
+    # direction alone gives a false alarm, since the possession-safe peek also
+    # strafes "left" but at a different speed/duration.
+    assert tuple(robot.calls[-1][1:]) not in {tuple(s) for s in OPENING_SEQUENCE}, (
+        f"expected normal play, not an opening step: {robot.calls[-1]}"
+    )
+    print(f"  -> skipped straight to normal chase: {robot.calls[-1]}")
+
+    print("[SELF-TEST] NEW: reset() re-arms the opening (Yellow Card sends both robots back to start)")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, empty_det, wall_unknown, hold_toggle=False)
+    assert policy._opening_step == 1, policy._opening_step
+    policy.reset()
+    assert policy._opening_step == 0, "after a card restart the opening must run again from the top"
+    print("  -> opening re-armed after reset()")
+
+    print("[SELF-TEST] NEW: goal-scored fires when a close ball vanishes at a confirmed opponent end")
+    fired = []
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot, on_goal_scored=lambda: fired.append(True))
+    close_ball = _FakeDetection("soccer_ball", 0.9, x=140, y=150, width=60, height=60)  # 19% of frame
+    opp_goal = _FakeDetection("goal", 0.9, x=100, y=20, width=120, height=60)
+    wall_opp = _FakeWallDetector("OPPONENT SIDE")
+    # Push at a confirmed opponent end with the ball close...
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball, opp_goal]), wall_opp, hold_toggle=False)
+    assert robot.calls[-1][1] == "forward", robot.calls
+    # ...then the ball vanishes. Coast window first, then genuinely lost.
+    for _ in range(COAST_TICKS + 1):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([]), wall_opp, hold_toggle=False)
+    assert fired, "expected the goal callback to fire when the ball vanished right after a close push"
+    print(f"  -> callback fired once ({len(fired)}x total)")
+
+    print("[SELF-TEST] NEW: goal-scored does NOT fire when the ball simply drifts away far from goal")
+    fired = []
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot, on_goal_scored=lambda: fired.append(True))
+    far_ball = _FakeDetection("soccer_ball", 0.9, x=152, y=150, width=15, height=15)  # 5% - too far to be a scoring push
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([far_ball, opp_goal]), wall_opp, hold_toggle=False)
+    for _ in range(COAST_TICKS + 1):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([]), wall_opp, hold_toggle=False)
+    assert not fired, "a distant ball going out of view is not a goal - must not celebrate"
+    print("  -> correctly stayed silent (ball was only 5% of frame, not a scoring push)")
+
+    print("[SELF-TEST] NEW: a celebration that raises must not end the match")
+    robot = _FakeRobot()
+    def _boom():
+        raise RuntimeError("celebration exploded")
+    policy = SoccerPolicy(robot, on_goal_scored=_boom)
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball, opp_goal]), wall_opp, hold_toggle=False)
+    for _ in range(COAST_TICKS + 1):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([]), wall_opp, hold_toggle=False)  # must not raise
+    print("  -> exception swallowed, play continued")
 
     print("[SELF-TEST] CRITICAL: a transient camera/inference failure must NEVER call stop()")
     # stop() sets program_enabled=false in firmware, ending the run until a
@@ -1060,6 +1334,9 @@ if __name__ == "__main__":
     far_left_ball = _FakeDetection("soccer_ball", 0.9, x=0, y=150, width=20, height=20)
     policy2.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([far_left_ball]), wall_unknown, hold_toggle=False)
     policy2.reset()
+    # reset() correctly re-arms the kickoff opening (asserted separately above);
+    # skip it here so this assertion measures ball-tracker state as intended.
+    policy2._opening_step = len(OPENING_SEQUENCE)
     policy2.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([]), wall_unknown, hold_toggle=False)
     assert robot2.calls[-1][2:] == (SEARCH_SPEED, TURN_MS), (
         "expected a fresh search after reset(), not a coast/prediction carried over from before it", robot2.calls[-1]
