@@ -109,7 +109,15 @@ if TYPE_CHECKING:
 # anything - it must be constructed with a min_confidence at or below the
 # lowest value here or these thresholds can never fire. See main.py.
 MIN_CONFIDENCE_BY_LABEL = {
-    "soccer_ball": 0.6,
+    # Ball also measured at the venue: a ball at 4-6% of frame width (i.e.
+    # genuinely far away) scored 0.50-0.72. At a 0.6 bar roughly 40% of true
+    # sightings were dropped, which on a small fast field is the difference
+    # between tracking the ball and repeatedly re-acquiring it.
+    #
+    # The false-positive risk is low and this is measured too, not assumed:
+    # across 88 consecutive frames with no ball in view, the model produced
+    # ZERO spurious soccer_ball detections even at a 0.3 display floor.
+    "soccer_ball": 0.45,
     "robot": 0.6,
     "goal": 0.45,
 }
@@ -625,18 +633,24 @@ if __name__ == "__main__":
     FRAME = _FakeFrame(240, 320)  # centre x = 160
     ENABLED_SENSORS = {"program_enabled": True, "ultrasonic_mm": -1}
 
-    print("[SELF-TEST] NEW: per-class confidence floors - a 0.55 goal is accepted, a 0.55 ball is not")
-    # Measured at the venue: real goal sightings land ~0.52-0.72. A single 0.6
-    # bar discarded most of them, which is what made goal detection look broken.
-    _mid_goal = _FakeDetection("goal", 0.55, x=100, y=20, width=120, height=60)
-    _mid_ball = _FakeDetection("soccer_ball", 0.55, x=150, y=150, width=20, height=20)
-    assert SoccerPolicy._above_threshold(_mid_goal) is not None, (
-        "a 0.55 goal must pass - this is the real-world range, and rejecting it is the bug we fixed"
+    print("[SELF-TEST] NEW: per-class confidence floors match what was measured at the venue")
+    # Real sightings measured Aug 14: goal 0.52-0.72, distant ball 0.50-0.72.
+    # A single 0.6 bar discarded most goals and ~40% of balls - that is what
+    # made detection look broken on the field. Both floors are now 0.45.
+    _mid_goal = _FakeDetection("goal", 0.51, x=100, y=20, width=120, height=60)
+    _mid_ball = _FakeDetection("soccer_ball", 0.51, x=150, y=150, width=20, height=20)
+    _weak_ball = _FakeDetection("soccer_ball", 0.30, x=150, y=150, width=20, height=20)
+    _mid_robot = _FakeDetection("robot", 0.51, x=20, y=20, width=130, height=100)
+    assert SoccerPolicy._above_threshold(_mid_goal) is not None, "0.51 goal must pass - real-world range"
+    assert SoccerPolicy._above_threshold(_mid_ball) is not None, "0.51 ball must pass - real-world range"
+    assert SoccerPolicy._above_threshold(_weak_ball) is None, "0.30 ball is noise, must still be rejected"
+    assert SoccerPolicy._above_threshold(_mid_robot) is None, (
+        "robot stays strict at 0.6 - a false opponent triggers juke/backoff and surrenders the ball"
     )
-    assert SoccerPolicy._above_threshold(_mid_ball) is None, (
-        "a 0.55 ball must still be rejected - the ball class is strong, and a phantom ball chase is costly"
+    print(
+        f"  -> goal={MIN_CONFIDENCE_BY_LABEL['goal']}  ball={MIN_CONFIDENCE_BY_LABEL['soccer_ball']}  "
+        f"robot={MIN_CONFIDENCE_BY_LABEL['robot']}"
     )
-    print(f"  -> goal floor={MIN_CONFIDENCE_BY_LABEL['goal']}, ball floor={MIN_CONFIDENCE_BY_LABEL['soccer_ball']}")
 
     print("[SELF-TEST] own-goal avoidance: centred ball + OWN SIDE goal -> peel off, never forward")
     robot = _FakeRobot()
