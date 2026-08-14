@@ -71,6 +71,30 @@ def _setting(name: str, default: str = "") -> str:
     return default
 
 
+def _team_is_blue(robot):
+    """Resolve which team we're on, as a callable read fresh each tick.
+
+    TEAM=auto (default) uses the CAM button's hold_toggle, which is the
+    mechanism the organizers specified. TEAM=red / TEAM=blue overrides it
+    outright - useful because the button is easy to get wrong under pressure
+    (it needs a 5-second hold, and the confirming LED is one of two lights on
+    the robot), whereas a config line is unambiguous and survives reboots.
+
+    Either way the robot ends up knowing its colour, which is what the rule
+    is actually about. Getting this wrong makes the robot attack its own net,
+    so whichever source is in use gets printed in the startup banner.
+    """
+    setting = _setting("TEAM", "auto").lower()
+    if setting in ("red", "r", "false", "0"):
+        return (lambda: False), "RED (forced by match_config)"
+    if setting in ("blue", "b", "true", "1"):
+        return (lambda: True), "BLUE (forced by match_config)"
+    if setting not in ("auto", ""):
+        print(f"[WARN] TEAM={setting!r} not understood - falling back to the CAM button")
+    current = "BLUE" if robot.hold_toggle() else "RED"
+    return robot.hold_toggle, f"{current} (from CAM button - hold 5s to change)"
+
+
 def _ensure_edge_impulse() -> bool:
     """Install edge_impulse_linux from the bundled wheel if it's missing.
 
@@ -136,8 +160,9 @@ def _open_camera():
     raise RuntimeError(f"camera produced no usable frame after {CAMERA_WARMUP_MAX_FRAMES} attempts")
 
 
-def run_match(robot, App, policy_class=None) -> None:
-    """Autonomous match play. policy_class lets trickshot reuse this loop."""
+def run_match(robot, App, policy_class=None, team_fn=None) -> None:
+    """Autonomous match play. policy_class lets trickshot reuse this loop.
+    team_fn returns True for BLUE - see _team_is_blue."""
     import ei_runner
     from robot_client import ProgramStopped
     from soccer_policy import SoccerPolicy
@@ -145,6 +170,7 @@ def run_match(robot, App, policy_class=None) -> None:
 
     model_path = _setting("EI_MODEL_PATH", DEFAULT_MODEL_PATH)
     policy_class = policy_class or SoccerPolicy
+    team_fn = team_fn or robot.hold_toggle
 
     try:
         cap = _open_camera()
@@ -191,7 +217,7 @@ def run_match(robot, App, policy_class=None) -> None:
                         if not ok or frame is None or frame.size == 0:
                             frame = None
                         policy.decide_and_act(
-                            frame, sensors, detector, wall, robot.hold_toggle(), frame_ts=frame_ts
+                            frame, sensors, detector, wall, team_fn(), frame_ts=frame_ts
                         )
                 except ProgramStopped:
                     print("[INFO] stopped - BOOT button disabled the program")
@@ -270,10 +296,11 @@ def main() -> None:
     # own-goal avoidance compares the field tape against - if it is wrong the
     # robot will confidently attack its own net. Printed as a banner because
     # it is the one setting that fails silently.
-    team = "BLUE" if robot.hold_toggle() else "RED"
+    team_fn, team_desc = _team_is_blue(robot)
     print("=" * 58)
-    print(f"   TEAM = {team}     (onboard RGB: red=RED, blue=BLUE)")
-    print("   Wrong? HOLD the CAM button 5s to toggle, then re-run.")
+    print(f"   TEAM = {team_desc}")
+    print("   Wrong? set TEAM=red or TEAM=blue in match_config.txt")
+    print("          (or TEAM=auto to use the CAM button's 5s hold)")
     print("   Check this before EVERY round - the ref can reassign it.")
     print("=" * 58)
 
@@ -299,7 +326,7 @@ def main() -> None:
 
     try:
         if mode == "match":
-            run_match(robot, App)
+            run_match(robot, App, team_fn=team_fn)
         elif mode == "vision":
             run_vision(robot)
         elif mode == "demo":
@@ -312,7 +339,7 @@ def main() -> None:
             App.run(user_loop=lambda: robot.run_program(lambda: run_precision_course(robot)))
         elif mode == "trickshot":
             from trick_shot import TrickShotPolicy
-            run_match(robot, App, policy_class=TrickShotPolicy)
+            run_match(robot, App, policy_class=TrickShotPolicy, team_fn=team_fn)
         elif mode == "fastball":
             run_fastball(robot, App)
         elif mode == "idle":

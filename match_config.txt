@@ -23,6 +23,17 @@
 MODE=match
 
 # ---------------------------------------------------------------------------
+# TEAM - which colour we are THIS round. Own-goal avoidance compares the
+# field tape against this, so a wrong value makes the robot attack its own
+# net. The ref reassigns it per round, so check it every game.
+#   red | blue   forces it here - unambiguous, survives reboots
+#   auto         uses the CAM button (hold 5s; solid RED/BLUE on the ONBOARD
+#                RGB, not the blinking blue ultrasonic ring, which is just
+#                the idle heartbeat)
+# ---------------------------------------------------------------------------
+TEAM=red
+
+# ---------------------------------------------------------------------------
 # START_CORNER - which corner the referee placed us in. Decides which way the
 # kickoff burst strafes. WRONG VALUE DRIVES INTO THE CORNER instead of onto
 # the goal line, so check it every round. Values: right | left
