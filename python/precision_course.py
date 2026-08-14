@@ -76,8 +76,13 @@ def run_precision_course(robot: MiniAutoRobot, max_seconds: float = MAX_SECONDS_
                 continue
 
             if all(bit == 1 for bit in line_digital):
+                # Deliberately does NOT call robot.stop(): that sets
+                # program_enabled=false and would end the whole course run at
+                # the first intersection (see soccer_policy design note 8).
+                # Issuing no drive command is enough - the previous bounded
+                # pulse has already auto-stopped in firmware, so the robot is
+                # standing still while we pause here.
                 print("[INFO] intersection / stop-line detected (all-one) - holding")
-                robot.stop()
                 time.sleep(STOP_LINE_PAUSE_SECONDS)
                 continue
 
@@ -161,11 +166,17 @@ if __name__ == "__main__":
     run_precision_course(robot, max_seconds=5)
     assert robot.calls[0] == ("drive", SEARCH_DIRECTION, SEARCH_SPEED, SEARCH_MS), robot.calls
 
-    print("[SELF-TEST] intersection (all-one) -> holds (stop()) before continuing, not just at the end")
+    print("[SELF-TEST] intersection (all-one) -> pauses WITHOUT stop(), which would end the run")
     robot = _FakeRobot([{"line_ok": True, "line_digital": [1, 1, 1, 1]}])
     run_precision_course(robot, max_seconds=5)
-    assert ("stop",) in robot.calls[:-1], "expected a mid-loop stop() from the intersection hold, not just the finally"
-    assert robot.calls[-1] == ("stop",), robot.calls
+    # A mid-loop stop() sets program_enabled=false in firmware, so the course
+    # would end at the FIRST intersection and need a human BOOT press. Issuing
+    # no drive command is enough: the previous bounded pulse already
+    # auto-stopped in firmware, so the robot is standing still during the hold.
+    assert ("stop",) not in robot.calls[:-1], (
+        f"intersection hold must not call stop() mid-loop - that ends the run. Got {robot.calls}"
+    )
+    assert robot.calls[-1] == ("stop",), "the finally-block stop() is correct and should remain"
 
     print("[SELF-TEST] ProgramStopped mid-move is caught, not raised - and stop() still runs")
     robot = _FakeRobot([{"line_ok": True, "line_digital": [1, 0, 0, 1]}], fail_at=1)

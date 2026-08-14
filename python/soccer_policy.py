@@ -35,25 +35,23 @@ THREE PIECES OF NON-OBVIOUS DESIGN IN THIS FILE, READ BEFORE TUNING:
    sweep" approach used in RoboCup Junior Soccer ball-recovery strategies),
    instead of a context-free coin flip.
 
-2. POSSESSION-SAFE GOAL SCANNING (search "POSSESSION-SAFE" below). The
-   object-detection model has only one generic "goal" class - it cannot tell
-   our goal from the opponent's by itself. The disambiguation trick: whenever
-   a "goal" box is seen, the SAME frame also gets classified by
-   wall_detector.WallSideDetector - whichever wall tape colour dominates
-   tells us which end of the field the camera faces, and comparing that to
-   our own team colour (hold_toggle) tells us whether the goal in view is
-   ours or theirs. The policy is now DELIBERATELY CONSERVATIVE about this:
-   it only commits to a full-speed push when the goal is POSITIVELY
-   confirmed as the opponent's. If it can't tell (no goal visible, or a goal
-   is visible but the wall tape isn't) - it does NOT default to pushing
-   anymore. Instead it protects the ball (no retreating, no driving away -
-   that would surrender it) while doing small bounded "peek" turns to try to
-   bring the wall tape into view, for a bounded grace period, before
-   cautiously proceeding at reduced speed if that grace period runs out
-   without resolving. HOW LONG TO STAY CAUTIOUS BEFORE PROCEEDING ANYWAY
-   (POSSESSION_SCAN_GRACE_TICKS) IS A REAL RISK-TOLERANCE CALL THE TEAM
-   SHOULD OWN, NOT SOMETHING I SHOULD HAVE PICKED UNILATERALLY - see the
-   constant below.
+2. POSSESSION-SAFE SCANNING (search "POSSESSION-SAFE" below). We must never
+   push the ball toward our OWN goal, so before committing to a full-speed
+   push the policy needs to know which end of the field it faces. That comes
+   from wall_detector.WallSideDetector reading the field tape, compared
+   against our own team colour (hold_toggle). The policy is DELIBERATELY
+   CONSERVATIVE: it only commits to a full-speed push when the end ahead is
+   POSITIVELY confirmed as the opponent's. If the tape can't be read at all,
+   it does NOT default to pushing. Instead it protects the ball (no
+   retreating, no driving away - that would surrender it) with small bounded
+   "peek" moves, for a bounded grace period, before cautiously proceeding at
+   reduced speed if that period runs out unresolved. HOW LONG TO STAY
+   CAUTIOUS BEFORE PROCEEDING ANYWAY (POSSESSION_SCAN_GRACE_TICKS) IS A REAL
+   RISK-TOLERANCE CALL THE TEAM SHOULD OWN - see the constant below.
+
+   NOTE: this used to be gated behind a "goal" detection - the wall was only
+   read on ticks where the model reported a goal. That gate is gone; see
+   design note 7 for why it was actively harmful.
 
 3. TWO-TIER OPPONENT CONTACT (search "opponent contesting" below). The
    Game Rules' Yellow Card conditions are CORNERING the opponent against a
@@ -70,6 +68,57 @@ THREE PIECES OF NON-OBVIOUS DESIGN IN THIS FILE, READ BEFORE TUNING:
    data - retune them tomorrow against how your actual robot and opponents
    behave, and lean AWAY from soft/skittish if anything - a robot that
    never contests the ball can't win a 1v1.
+
+7. THE WALL IS READ EVERY TICK, NOT ONLY WHEN A GOAL IS DETECTED (search
+   "design note 7" below). Two different questions were previously welded
+   together: "is there a goal in view?" (the model's job, and the weakest
+   output it has - see capture.py's venue note) and "which end of the field
+   am I facing?" (wall_detector's job). The second was gated behind the
+   first, which turned every goal-class error into a policy error:
+
+     FALSE NEGATIVE - a real goal missed meant goal_side went unresolved,
+       the policy peeked for POSSESSION_SCAN_GRACE_TICKS, then pushed
+       forward BLIND at CAUTIOUS_PUSH_SPEED with no idea which goal was
+       ahead. Facing our own net, that is an own goal - i.e. a missed
+       detection did not degrade own-goal avoidance, it SKIPPED it.
+     FALSE POSITIVE - a goal reported where there was none meant the wall
+       got classified on a frame with no goal in it, returned a confident
+       answer, and the policy drove on it at full speed. Worse, the memory
+       window below then extended one bad frame's influence over several
+       ticks.
+
+   But the second question never needed the first. The tape runs down the
+   SIDE walls, visible almost everywhere on the field - a goal does not have
+   to be in frame to know which way we're pointing. So the wall is now read
+   unconditionally at the decision point and the goal detection is advisory
+   only: logged, never steered on. Both failure modes above stop being able
+   to cause a wrong turn.
+
+   Cost is ~0.5ms/tick measured (~3ms budgeted for the UNO Q's slower CPU)
+   against a tick dominated by drive()'s 300-350ms block, and it REMOVES the
+   6-tick peek in the common case - so it is a net speed win of roughly 75x,
+   not a tradeoff. It does not touch ball detection or aiming: those branches
+   return before reaching this code.
+
+8. THIS POLICY NEVER CALLS robot.stop() - AND MUST NOT. The firmware's stop
+   RPC does not merely halt the motors, it also sets program_enabled=false
+   (see rpcStop in sketch/sketch.ino), which ends the whole run: the caller's
+   `while robot.is_running()` loop exits and a human has to press the BOOT
+   button again to resume. The developer guide flags this too - stop() is a
+   session-ending fail-safe and finally-cleanup call, not a control-flow tool.
+
+   An earlier version of this file called stop() on a missing frame, a stale
+   frame, an empty frame, or an inference error. All four are TRANSIENT, and
+   over a Wi-Fi MJPEG stream competing with ~30 other robot APs in the room,
+   a dropped frame during a 5-minute match is close to certain. So the robot
+   would shut itself off mid-match on the first hiccup and sit dead until
+   someone re-pressed BOOT. Caught by a teammate before the tournament.
+
+   Simply returning is already the correct safe response: every drive() this
+   policy issues is a bounded 150-250ms pulse that the firmware auto-stops on
+   its own timer, so a skipped tick coasts to a halt within one pulse and
+   play resumes the moment frames return. Session-ending stop() belongs only
+   in the caller's finally block (see main.py).
 
 Only project-local modules (ei_runner, wall_detector, robot_client) are
 imported here, and only under TYPE_CHECKING - decide_and_act() only ever
@@ -109,7 +158,15 @@ if TYPE_CHECKING:
 # anything - it must be constructed with a min_confidence at or below the
 # lowest value here or these thresholds can never fire. See main.py.
 MIN_CONFIDENCE_BY_LABEL = {
-    "soccer_ball": 0.6,
+    # Ball also measured at the venue: a ball at 4-6% of frame width (i.e.
+    # genuinely far away) scored 0.50-0.72. At a 0.6 bar roughly 40% of true
+    # sightings were dropped, which on a small fast field is the difference
+    # between tracking the ball and repeatedly re-acquiring it.
+    #
+    # The false-positive risk is low and this is measured too, not assumed:
+    # across 88 consecutive frames with no ball in view, the model produced
+    # ZERO spurious soccer_ball detections even at a 0.3 display floor.
+    "soccer_ball": 0.45,
     "robot": 0.6,
     "goal": 0.45,
 }
@@ -336,30 +393,31 @@ class SoccerPolicy:
         if not sensors.get("program_enabled"):
             return
 
-        # 2) Never drive on missing or stale vision.
+        # 2) Never drive on missing or stale vision - but do NOT call
+        # robot.stop() here. See design note 8: stop() ends the whole session.
+        # Simply returning is already a safe no-op, because every drive() this
+        # policy issues is a bounded 150-250ms pulse that the FIRMWARE
+        # auto-stops on its own timer. Skipping a tick therefore coasts to a
+        # halt within one pulse and resumes the instant frames come back.
         if frame_bgr is None:
-            print("[WARN] soccer_policy: no camera frame available - stopping")
-            self.robot.stop()
+            print("[WARN] soccer_policy: no camera frame this tick - skipping (motors auto-stop)")
             return
         if frame_ts is None:
             frame_ts = now
         elif (now - frame_ts) > FRAME_STALE_SEC:
-            print(f"[WARN] soccer_policy: frame is {now - frame_ts:.2f}s stale - stopping")
-            self.robot.stop()
+            print(f"[WARN] soccer_policy: frame is {now - frame_ts:.2f}s stale - skipping tick")
             return
 
         frame_h, frame_w = frame_bgr.shape[0], frame_bgr.shape[1]
         if frame_w <= 0 or frame_h <= 0:
-            print("[WARN] soccer_policy: empty frame - stopping")
-            self.robot.stop()
+            print("[WARN] soccer_policy: empty frame - skipping tick")
             return
 
         # 3) Infer, then Validate against our own confidence bar.
         try:
             detections = detector.infer(frame_bgr)
         except Exception as exc:  # noqa: BLE001 - one bad frame must not crash the match loop
-            print(f"[WARN] soccer_policy: inference failed ({exc}) - stopping")
-            self.robot.stop()
+            print(f"[WARN] soccer_policy: inference failed ({exc}) - skipping tick")
             return
 
         opponent = self._above_threshold(detector.best(detections, "robot"))
@@ -455,25 +513,37 @@ class SoccerPolicy:
 
         # track_state == "tracking" and centred: the scoring decision point.
         # --- OWN-GOAL-AVOIDANCE / POSSESSION-SAFE SCANNING (design note 2) -
+        # Read the wall on EVERY tick that reaches this decision point - NOT
+        # only when the model happened to report a goal. See design note 7.
+        classification = wall.classify(frame_bgr, team_is_blue=hold_toggle)
+        wall_side = classification["result"]  # "OWN SIDE" / "OPPONENT SIDE" / "UNKNOWN"
+        print(wall.field_line(classification))
+
+        # The goal detection is now ADVISORY ONLY - logged, never steered on.
+        # The `goal` class is the weakest output of both trained models, and
+        # gating the own-goal decision behind it meant one missed detection
+        # skipped own-goal avoidance entirely (design note 7).
         goal = self._above_threshold(detector.best(detections, "goal"))
         if goal is not None:
-            classification = wall.classify(frame_bgr, team_is_blue=hold_toggle)
-            goal_side = classification["result"]  # "OWN SIDE" / "OPPONENT SIDE" / "UNKNOWN"
-            print(wall.field_line(classification))
-            print(f"[POLICY] goal in view (conf={goal.confidence:.2f}) -> {goal_side}")
-            self._last_goal_side = goal_side
+            print(f"[POLICY] goal in view (conf={goal.confidence:.2f}) - advisory, not steered on")
+
+        if wall_side in ("OWN SIDE", "OPPONENT SIDE"):
+            goal_side = wall_side
+            # Only DECISIVE readings are remembered. Storing "UNKNOWN" here
+            # would let a single glare/bad-angle frame overwrite a good
+            # confirmation, which is strictly worse than keeping the old one.
+            self._last_goal_side = wall_side
             self._last_goal_side_age = 0
         elif self._last_goal_side is not None and self._last_goal_side_age < GOAL_MEMORY_TICKS:
-            # No goal detected THIS tick, but we confirmed one recently and
-            # the ball is centred+close right now (design note 6) - very
-            # plausibly our own ball occluding the goal on final approach,
-            # not that the goal genuinely isn't there. Trust the recent
-            # memory instead of immediately treating this as unresolved.
+            # Wall unreadable THIS tick (glare, bad angle, tape out of the
+            # detector's band) but we had a decisive reading moments ago and
+            # the robot cannot have spun around in that time. Trust it briefly
+            # rather than discarding a good answer over one bad frame.
             self._last_goal_side_age += 1
             goal_side = self._last_goal_side
             print(
-                f"[POLICY] goal not detected this tick (age={self._last_goal_side_age}/{GOAL_MEMORY_TICKS}) "
-                f"- trusting recent memory: {goal_side}"
+                f"[POLICY] wall unreadable this tick (age={self._last_goal_side_age}/{GOAL_MEMORY_TICKS}) "
+                f"- trusting recent reading: {goal_side}"
             )
         else:
             goal_side = None
@@ -611,6 +681,20 @@ if __name__ == "__main__":
         def field_line(self, classification: dict) -> str:
             return f"[FIELD] (self-test) -> {classification['result']}"
 
+    class _ScriptedWallDetector(_FakeWallDetector):
+        """Returns a different verdict per tick - needed now that the wall is
+        read EVERY tick (design note 7), so tests that used to simulate "the
+        model lost the goal" must instead simulate "the tape became
+        unreadable"."""
+
+        def __init__(self, script) -> None:
+            super().__init__("UNKNOWN")
+            self._script = list(script)
+
+        def classify(self, frame_bgr, team_is_blue: bool) -> dict:
+            self.result = self._script.pop(0) if self._script else "UNKNOWN"
+            return super().classify(frame_bgr, team_is_blue)
+
     class _FakeRobot:
         def __init__(self) -> None:
             self.calls = []
@@ -625,18 +709,24 @@ if __name__ == "__main__":
     FRAME = _FakeFrame(240, 320)  # centre x = 160
     ENABLED_SENSORS = {"program_enabled": True, "ultrasonic_mm": -1}
 
-    print("[SELF-TEST] NEW: per-class confidence floors - a 0.55 goal is accepted, a 0.55 ball is not")
-    # Measured at the venue: real goal sightings land ~0.52-0.72. A single 0.6
-    # bar discarded most of them, which is what made goal detection look broken.
-    _mid_goal = _FakeDetection("goal", 0.55, x=100, y=20, width=120, height=60)
-    _mid_ball = _FakeDetection("soccer_ball", 0.55, x=150, y=150, width=20, height=20)
-    assert SoccerPolicy._above_threshold(_mid_goal) is not None, (
-        "a 0.55 goal must pass - this is the real-world range, and rejecting it is the bug we fixed"
+    print("[SELF-TEST] NEW: per-class confidence floors match what was measured at the venue")
+    # Real sightings measured Aug 14: goal 0.52-0.72, distant ball 0.50-0.72.
+    # A single 0.6 bar discarded most goals and ~40% of balls - that is what
+    # made detection look broken on the field. Both floors are now 0.45.
+    _mid_goal = _FakeDetection("goal", 0.51, x=100, y=20, width=120, height=60)
+    _mid_ball = _FakeDetection("soccer_ball", 0.51, x=150, y=150, width=20, height=20)
+    _weak_ball = _FakeDetection("soccer_ball", 0.30, x=150, y=150, width=20, height=20)
+    _mid_robot = _FakeDetection("robot", 0.51, x=20, y=20, width=130, height=100)
+    assert SoccerPolicy._above_threshold(_mid_goal) is not None, "0.51 goal must pass - real-world range"
+    assert SoccerPolicy._above_threshold(_mid_ball) is not None, "0.51 ball must pass - real-world range"
+    assert SoccerPolicy._above_threshold(_weak_ball) is None, "0.30 ball is noise, must still be rejected"
+    assert SoccerPolicy._above_threshold(_mid_robot) is None, (
+        "robot stays strict at 0.6 - a false opponent triggers juke/backoff and surrenders the ball"
     )
-    assert SoccerPolicy._above_threshold(_mid_ball) is None, (
-        "a 0.55 ball must still be rejected - the ball class is strong, and a phantom ball chase is costly"
+    print(
+        f"  -> goal={MIN_CONFIDENCE_BY_LABEL['goal']}  ball={MIN_CONFIDENCE_BY_LABEL['soccer_ball']}  "
+        f"robot={MIN_CONFIDENCE_BY_LABEL['robot']}"
     )
-    print(f"  -> goal floor={MIN_CONFIDENCE_BY_LABEL['goal']}, ball floor={MIN_CONFIDENCE_BY_LABEL['soccer_ball']}")
 
     print("[SELF-TEST] own-goal avoidance: centred ball + OWN SIDE goal -> peel off, never forward")
     robot = _FakeRobot()
@@ -795,11 +885,35 @@ if __name__ == "__main__":
     policy.decide_and_act(FRAME, disabled_sensors, _FakeDetector([]), wall_unknown, hold_toggle=False)
     assert robot.calls == [], robot.calls
 
-    print("[SELF-TEST] missing frame -> stop(), never drive blind")
-    robot = _FakeRobot()
-    policy = SoccerPolicy(robot)
-    policy.decide_and_act(None, ENABLED_SENSORS, _FakeDetector([]), wall_unknown, hold_toggle=False)
-    assert robot.calls == [("stop",)], robot.calls
+    print("[SELF-TEST] CRITICAL: a transient camera/inference failure must NEVER call stop()")
+    # stop() sets program_enabled=false in firmware, ending the run until a
+    # human re-presses BOOT. Over a Wi-Fi MJPEG stream sharing the room with
+    # ~30 other robot APs, a dropped frame in a 5-minute match is near certain
+    # - so calling stop() here means the robot shuts itself off mid-match on
+    # the first hiccup. All four transient paths must simply skip the tick and
+    # let the firmware's own bounded-pulse timer coast the motors to a halt.
+    class _ExplodingDetector:
+        def infer(self, frame_bgr):
+            raise RuntimeError("simulated inference failure")
+
+        def best(self, detections, label):
+            return None
+
+    for label, frame, det, ts in (
+        ("missing frame", None, _FakeDetector([]), None),
+        ("empty frame", _FakeFrame(0, 0), _FakeDetector([]), None),
+        ("stale frame", FRAME, _FakeDetector([]), time.monotonic() - (FRAME_STALE_SEC + 5)),
+        ("inference error", FRAME, _ExplodingDetector(), None),
+    ):
+        robot = _FakeRobot()
+        policy = SoccerPolicy(robot)
+        policy.decide_and_act(frame, ENABLED_SENSORS, det, wall_unknown, hold_toggle=False, frame_ts=ts)
+        assert ("stop",) not in robot.calls, (
+            f"{label}: called stop(), which ends the run and requires a human BOOT press to recover. "
+            f"Return instead - bounded drive pulses auto-stop in firmware. Got {robot.calls}"
+        )
+        assert robot.calls == [], f"{label}: must not drive on bad vision either, got {robot.calls}"
+    print("  -> all four transient failures skip the tick without ending the session")
 
     print("[SELF-TEST] NEW: de-wedge - sustained confirmed pushes trigger one nudge, then resume pushing")
     robot = _FakeRobot()
@@ -833,30 +947,86 @@ if __name__ == "__main__":
     assert widened, "expected the search to eventually widen into a strafe, got only rotations: " + str(robot.calls)
     print(f"  -> search widened into a strafe ({robot.calls[-1]}) after prolonged loss, not endless in-place rotation")
 
-    print("[SELF-TEST] NEW: goal-side memory - own ball occluding the goal on final approach doesn't undo a confirmation")
-    robot = _FakeRobot()
-    policy = SoccerPolicy(robot)
     close_ball = _FakeDetection("soccer_ball", 0.9, x=140, y=150, width=60, height=60)  # centre_x=170, close
     opp_goal = _FakeDetection("goal", 0.9, x=100, y=20, width=120, height=60)
     wall_opponent = _FakeWallDetector("OPPONENT SIDE")
-    # Tick 1: goal genuinely visible -> confirmed OPPONENT SIDE, pushes forward, memory recorded.
-    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball, opp_goal]), wall_opponent, hold_toggle=False)
-    assert robot.calls[-1][1] == "forward", f"expected the confirmed push, got {robot.calls[-1]}"
-    # Tick 2: ball still centred+close and tracking, but NO goal this tick (our own ball occluding it) -
-    # must still push, trusting the fresh memory, not fall into possession-safe scanning.
-    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball]), wall_opponent, hold_toggle=False)
-    last = robot.calls[-1]
-    assert last[1] == "forward", f"expected memory to keep pushing through brief self-occlusion, got {last}"
-    print(f"  -> {last}  (kept pushing through one tick of the goal being occluded by our own ball)")
-    # Exhaust the memory window with the goal still missing every tick - eventually must fall back
-    # to possession-safe scanning rather than trusting stale memory forever.
-    for _ in range(GOAL_MEMORY_TICKS):
+
+    print("[SELF-TEST] design note 7: a MISSED goal no longer loses goal_side - the wall still answers")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    # The false-negative case that used to skip own-goal avoidance entirely: model never reports
+    # the goal, but the tape is perfectly readable. Must push immediately at full confirmed speed,
+    # NOT peek for POSSESSION_SCAN_GRACE_TICKS and then push blind.
+    for _ in range(4):
         policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball]), wall_opponent, hold_toggle=False)
+    assert all(c[1] == "forward" for c in robot.calls), (
+        f"a missed goal must not cost us the push - got {[c[1] for c in robot.calls]}"
+    )
+    assert robot.calls[-1][2] > CAUTIOUS_PUSH_SPEED, (
+        f"expected a CONFIRMED-speed push, not the cautious fallback, got {robot.calls[-1]}"
+    )
+    print(f"  -> {[c[1] for c in robot.calls]} at speed {robot.calls[-1][2]}  (no peek, no blind push)")
+
+    print("[SELF-TEST] design note 7: a MISSED goal facing our OWN net still peels off (the own-goal case)")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    for _ in range(3):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball]),
+                              _FakeWallDetector("OWN SIDE"), hold_toggle=False)
+    assert all(c[1] != "forward" for c in robot.calls), (
+        f"THIS IS THE OWN-GOAL BUG: pushed forward toward our own net - got {robot.calls}"
+    )
+    print(f"  -> {[c[1] for c in robot.calls]}  (peeled off every tick, never pushed into our own goal)")
+
+    print("[SELF-TEST] design note 7: a HALLUCINATED goal cannot steer - only the wall does")
+    robot_fp = _FakeRobot()
+    policy_fp = SoccerPolicy(robot_fp)
+    robot_clean = _FakeRobot()
+    policy_clean = SoccerPolicy(robot_clean)
+    for _ in range(4):
+        # identical wall verdict, one run fed a phantom goal detection the other isn't
+        policy_fp.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball, opp_goal]),
+                                 _FakeWallDetector("OWN SIDE"), hold_toggle=False)
+        policy_clean.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball]),
+                                    _FakeWallDetector("OWN SIDE"), hold_toggle=False)
+    assert robot_fp.calls == robot_clean.calls, (
+        "a false-positive goal changed behaviour - the goal class must be advisory only\n"
+        f"  with phantom goal: {robot_fp.calls}\n  without:           {robot_clean.calls}"
+    )
+    print(f"  -> identical actions with and without the phantom goal ({[c[1] for c in robot_fp.calls]})")
+
+    print("[SELF-TEST] wall-reading memory - a briefly unreadable tape doesn't undo a good reading")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    # Tick 1 the tape reads cleanly; after that it goes unreadable (glare / bad angle) every tick.
+    scripted = _ScriptedWallDetector(["OPPONENT SIDE"] + ["UNKNOWN"] * (GOAL_MEMORY_TICKS + 4))
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball]), scripted, hold_toggle=False)
+    assert robot.calls[-1][1] == "forward", f"expected the confirmed push, got {robot.calls[-1]}"
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball]), scripted, hold_toggle=False)
+    last = robot.calls[-1]
+    assert last[1] == "forward", f"expected memory to bridge one unreadable tick, got {last}"
+    print(f"  -> {last}  (kept pushing through one unreadable-tape tick)")
+    for _ in range(GOAL_MEMORY_TICKS):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball]), scripted, hold_toggle=False)
     last = robot.calls[-1]
     assert last[1] in ("left", "right") and last[2:] == (POSSESSION_SCAN_SPEED, POSSESSION_SCAN_TURN_MS), (
         f"expected memory to expire and fall back to possession-safe scanning, got {last}"
     )
-    print(f"  -> {last}  (memory correctly expired after {GOAL_MEMORY_TICKS} ticks with no goal redetected)")
+    print(f"  -> {last}  (memory correctly expired after {GOAL_MEMORY_TICKS} unreadable ticks)")
+
+    print("[SELF-TEST] wall-reading memory stores only DECISIVE readings - one bad frame can't erase a good one")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    # OPPONENT SIDE, then a single unreadable frame, then unreadable again. If UNKNOWN were stored
+    # as if it were a confirmation, the good reading would be gone and this would start peeking.
+    scripted = _ScriptedWallDetector(["OPPONENT SIDE", "UNKNOWN", "UNKNOWN"])
+    for _ in range(3):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball]), scripted, hold_toggle=False)
+    assert policy._last_goal_side == "OPPONENT SIDE", (
+        f"an UNKNOWN reading must not overwrite a good one, got {policy._last_goal_side!r}"
+    )
+    assert all(c[1] == "forward" for c in robot.calls), f"expected to keep pushing, got {robot.calls}"
+    print(f"  -> memory still {policy._last_goal_side!r} after 2 unreadable frames; kept pushing")
 
     print("[SELF-TEST] NEW: goal-side memory is invalidated once the ball itself is genuinely lost (not just coasting)")
     robot = _FakeRobot()
