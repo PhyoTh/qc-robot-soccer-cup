@@ -196,6 +196,20 @@ DEWEDGE_MS = 200
 SEARCH_ESCALATE_AFTER_TICKS = 15
 SEARCH_WIDEN_EVERY_TICKS = 5
 
+# --- Goal-side memory (design note 6) ---------------------------------------
+# Added live at the venue: the moment the robot is closest to actually
+# scoring - ball centred, close, right in front of the goal - is exactly the
+# moment the ball itself is most likely to be occluding the goal from the
+# camera's view. Without this, a goal that drops out of view on the final
+# approach gets treated as fully unresolved and the policy starts peeking
+# side to side, undoing a confirmation it just made a moment ago. Trust a
+# recently-confirmed goal_side for a short window after the goal itself
+# stops being detected, instead of immediately discarding it. Invalidated
+# the instant the ball itself is lost (see track_state == "lost" below) -
+# this is specifically about surviving OUR OWN ball blocking the view, not
+# about remembering goal position after looking somewhere else entirely.
+GOAL_MEMORY_TICKS = 5
+
 
 class _BallTracker:
     """Lightweight alpha-beta/EMA-style tracker: smooths a velocity estimate
@@ -283,6 +297,8 @@ class SoccerPolicy:
         self._scan_turn_left_next = True  # alternates the possession-safe "peek" turn
         self._possession_scan_ticks = 0
         self._consecutive_push_ticks = 0  # see DEWEDGE_PUSH_TICKS
+        self._last_goal_side: Optional[str] = None  # see GOAL_MEMORY_TICKS
+        self._last_goal_side_age = 0
 
     def decide_and_act(
         self,
@@ -364,6 +380,7 @@ class SoccerPolicy:
         if track_state == "lost":
             self._possession_scan_ticks = 0
             self._consecutive_push_ticks = 0
+            self._last_goal_side = None  # ball itself is gone, not just occluded - don't trust old goal memory
             if self._search_turn_left_next is None:
                 self._search_turn_left_next = self._tracker.last_known_side_left(frame_w)
             direction = "rotate_left" if self._search_turn_left_next else "rotate_right"
@@ -420,12 +437,28 @@ class SoccerPolicy:
         # track_state == "tracking" and centred: the scoring decision point.
         # --- OWN-GOAL-AVOIDANCE / POSSESSION-SAFE SCANNING (design note 2) -
         goal = self._above_threshold(detector.best(detections, "goal"))
-        goal_side = None
         if goal is not None:
             classification = wall.classify(frame_bgr, team_is_blue=hold_toggle)
             goal_side = classification["result"]  # "OWN SIDE" / "OPPONENT SIDE" / "UNKNOWN"
             print(wall.field_line(classification))
             print(f"[POLICY] goal in view (conf={goal.confidence:.2f}) -> {goal_side}")
+            self._last_goal_side = goal_side
+            self._last_goal_side_age = 0
+        elif self._last_goal_side is not None and self._last_goal_side_age < GOAL_MEMORY_TICKS:
+            # No goal detected THIS tick, but we confirmed one recently and
+            # the ball is centred+close right now (design note 6) - very
+            # plausibly our own ball occluding the goal on final approach,
+            # not that the goal genuinely isn't there. Trust the recent
+            # memory instead of immediately treating this as unresolved.
+            self._last_goal_side_age += 1
+            goal_side = self._last_goal_side
+            print(
+                f"[POLICY] goal not detected this tick (age={self._last_goal_side_age}/{GOAL_MEMORY_TICKS}) "
+                f"- trusting recent memory: {goal_side}"
+            )
+        else:
+            goal_side = None
+            self._last_goal_side = None
 
         if goal_side == "OWN SIDE":
             print("[POLICY] ball centred but OWN goal is ahead - peeling off, not pushing")
@@ -765,6 +798,44 @@ if __name__ == "__main__":
     assert widened, "expected the search to eventually widen into a strafe, got only rotations: " + str(robot.calls)
     print(f"  -> search widened into a strafe ({robot.calls[-1]}) after prolonged loss, not endless in-place rotation")
 
+    print("[SELF-TEST] NEW: goal-side memory - own ball occluding the goal on final approach doesn't undo a confirmation")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    close_ball = _FakeDetection("soccer_ball", 0.9, x=140, y=150, width=60, height=60)  # centre_x=170, close
+    opp_goal = _FakeDetection("goal", 0.9, x=100, y=20, width=120, height=60)
+    wall_opponent = _FakeWallDetector("OPPONENT SIDE")
+    # Tick 1: goal genuinely visible -> confirmed OPPONENT SIDE, pushes forward, memory recorded.
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball, opp_goal]), wall_opponent, hold_toggle=False)
+    assert robot.calls[-1][1] == "forward", f"expected the confirmed push, got {robot.calls[-1]}"
+    # Tick 2: ball still centred+close and tracking, but NO goal this tick (our own ball occluding it) -
+    # must still push, trusting the fresh memory, not fall into possession-safe scanning.
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball]), wall_opponent, hold_toggle=False)
+    last = robot.calls[-1]
+    assert last[1] == "forward", f"expected memory to keep pushing through brief self-occlusion, got {last}"
+    print(f"  -> {last}  (kept pushing through one tick of the goal being occluded by our own ball)")
+    # Exhaust the memory window with the goal still missing every tick - eventually must fall back
+    # to possession-safe scanning rather than trusting stale memory forever.
+    for _ in range(GOAL_MEMORY_TICKS):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball]), wall_opponent, hold_toggle=False)
+    last = robot.calls[-1]
+    assert last[1] in ("left", "right") and last[2:] == (POSSESSION_SCAN_SPEED, POSSESSION_SCAN_TURN_MS), (
+        f"expected memory to expire and fall back to possession-safe scanning, got {last}"
+    )
+    print(f"  -> {last}  (memory correctly expired after {GOAL_MEMORY_TICKS} ticks with no goal redetected)")
+
+    print("[SELF-TEST] NEW: goal-side memory is invalidated once the ball itself is genuinely lost (not just coasting)")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([close_ball, opp_goal]), wall_opponent, hold_toggle=False)
+    assert policy._last_goal_side == "OPPONENT SIDE", "expected the confirmation to be remembered"
+    # One missing-ball tick alone is "coasting", not "lost" (COAST_TICKS is exactly for this) - the
+    # goal memory correctly isn't touched during a brief coast, same as it survives brief goal-only
+    # occlusion. Exhaust the whole coast window before the ball is genuinely "lost".
+    for _ in range(COAST_TICKS + 1):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([]), wall_opponent, hold_toggle=False)
+    assert policy._last_goal_side is None, "losing the ball entirely (past the coast window) must invalidate goal memory"
+    print(f"  -> memory survived the {COAST_TICKS}-tick coast window intact, then cleared once genuinely lost")
+
     print("[SELF-TEST] NEW: reset() clears all cross-tick state - stale tracking doesn't survive a fresh session")
     robot = _FakeRobot()
     policy = SoccerPolicy(robot)
@@ -776,6 +847,7 @@ if __name__ == "__main__":
     assert policy._search_turn_left_next is None, "reset() must clear the search-direction seed"
     assert policy._possession_scan_ticks == 0, "reset() must clear the possession-scan counter"
     assert policy._consecutive_push_ticks == 0, "reset() must clear the de-wedge push counter"
+    assert policy._last_goal_side is None, "reset() must clear the goal-side memory"
     # And behaviourally: immediately after reset(), a never-before-seen ball is "tracking", not "coasting"
     # on stale velocity - i.e. reset() really did forget the old ball, not just its counters.
     robot2 = _FakeRobot()
