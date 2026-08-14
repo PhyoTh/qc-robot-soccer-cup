@@ -357,6 +357,29 @@ FORWARD_MS_PER_INCH = 100.0
 # between looks.
 OPENING_CHUNK_MS = 300
 
+# --- Wall unstick during search ---------------------------------------------
+# Reported from the field: while searching, the robot can end up parked
+# against a side wall and stay there. Rotating in place cannot wedge it, but
+# it also cannot fix it - from hard against a wall most of the frame is wall,
+# so there is very little field in view for the ball to appear in, and the
+# search can burn the rest of the match looking at plywood.
+#
+# The ultrasonic sensor is dead on this chassis, so "am I against a wall?"
+# has to come from the camera. The signal used is total tape coverage: the
+# side walls carry tape along their length, so when the frame is mostly tape
+# the wall is filling the view, which only happens up close. Combined red+blue
+# coverage above this fraction of the wall band counts as nose-to-wall.
+#
+# Deliberately only applied while SEARCHING. During ball chase a big tape
+# reading is normal and expected (the ball is often near a wall), and
+# reversing there would abandon the ball.
+WALL_STUCK_COVERAGE_PCT = 30.0
+# Only after the search has already failed for a while - a brief glimpse of
+# wall mid-sweep is not stuck, it is just part of turning around.
+WALL_STUCK_AFTER_TICKS = 6
+WALL_BACKUP_SPEED = 140
+WALL_BACKUP_MS = 350
+
 # Stop short of the ball rather than driving through where it sits: the
 # normal closed-loop chase should make the final approach, and overshooting
 # risks knocking the ball somewhere random before we ever see it.
@@ -635,11 +658,30 @@ class SoccerPolicy:
             direction = "rotate_left" if self._search_turn_left_next else "rotate_right"
             self._search_turn_left_next = not self._search_turn_left_next
 
+            ticks_lost = self._tracker.ticks_since_seen
+
+            # Wall unstick: parked against a side wall, rotating in place just
+            # surveys plywood - there is barely any field in frame for the
+            # ball to appear in. Back off first, then carry on searching from
+            # somewhere the sweep can actually see something.
+            if ticks_lost > WALL_STUCK_AFTER_TICKS:
+                try:
+                    coverage = wall.analyze(frame_bgr)
+                    tape_pct = coverage.get("red_pct", 0.0) + coverage.get("blue_pct", 0.0)
+                except Exception:  # noqa: BLE001 - never let a vision hiccup break search
+                    tape_pct = 0.0
+                if tape_pct >= WALL_STUCK_COVERAGE_PCT:
+                    print(
+                        f"[POLICY] wall fills {tape_pct:.0f}% of view after {ticks_lost} lost ticks "
+                        f"- backing off before searching further"
+                    )
+                    self.robot.drive("backward", speed=WALL_BACKUP_SPEED, ms=WALL_BACKUP_MS)
+                    return
+
             # Escalating search (design note 5): once genuinely lost for a
             # while (past the coast window, then past this extra grace
             # period too), mix in an occasional strafe instead of only
             # rotating in place forever, to cover more of the frame.
-            ticks_lost = self._tracker.ticks_since_seen
             if ticks_lost > SEARCH_ESCALATE_AFTER_TICKS and ticks_lost % SEARCH_WIDEN_EVERY_TICKS == 0:
                 strafe_direction = "left" if direction == "rotate_left" else "right"
                 print(
@@ -1145,6 +1187,54 @@ if __name__ == "__main__":
         f"after the opening the normal search should take over, got {robot.calls[-1]}"
     )
     print(f"  -> ran {len(OPENING_SEQUENCE)} opening step(s), then normal search")
+
+    print("[SELF-TEST] NEW: backs off a wall that fills the view during a prolonged search")
+
+    class _WallHeavyDetector:
+        """Wall detector stand-in reporting the frame is mostly tape - what
+        the real one returns with the robot's nose against a side wall."""
+
+        def analyze(self, frame_bgr):
+            return {"side": "RED", "red_pct": 40.0, "blue_pct": 2.0}
+
+        def classify(self, frame_bgr, team_is_blue):
+            return {"side": "RED", "red_pct": 40.0, "blue_pct": 2.0,
+                    "team": "RED", "wall": "RED", "result": "OWN SIDE"}
+
+        def field_line(self, classification):
+            return "[FIELD] (self-test) wall-heavy"
+
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    policy._opening_step = len(OPENING_SEQUENCE)  # not what this test is about
+    wall_heavy = _WallHeavyDetector()
+    empty = _FakeDetector([])
+    # Early ticks: a bit of wall in view is normal mid-sweep, keep rotating.
+    for _ in range(WALL_STUCK_AFTER_TICKS):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, empty, wall_heavy, hold_toggle=False)
+        assert robot.calls[-1][1].startswith("rotate"), (
+            f"should still be sweeping this early, got {robot.calls[-1]}"
+        )
+    # Past the grace period with the wall still filling the frame -> back off.
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, empty, wall_heavy, hold_toggle=False)
+    assert robot.calls[-1] == ("drive", "backward", WALL_BACKUP_SPEED, WALL_BACKUP_MS), (
+        f"expected a back-off once wedged against the wall, got {robot.calls[-1]}"
+    )
+    print(f"  -> swept {WALL_STUCK_AFTER_TICKS} ticks, then backed off: {robot.calls[-1]}")
+
+    print("[SELF-TEST] NEW: a wall in view does NOT interrupt an active ball chase")
+    # Tape filling the frame is normal when the ball is near a wall - reversing
+    # there would abandon the ball, so the unstick must be search-only.
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    policy._opening_step = len(OPENING_SEQUENCE)
+    side_ball = _FakeDetection("soccer_ball", 0.9, x=0, y=150, width=20, height=20)
+    for _ in range(WALL_STUCK_AFTER_TICKS + 3):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([side_ball]), wall_heavy, hold_toggle=False)
+        assert robot.calls[-1][1] != "backward", (
+            f"must keep chasing the ball even with a wall in frame, got {robot.calls[-1]}"
+        )
+    print(f"  -> kept chasing across {WALL_STUCK_AFTER_TICKS + 3} ticks: {robot.calls[-1]}")
 
     print("[SELF-TEST] NEW: opening spots the ball MID-APPROACH and stops driving blind")
     # The forward burst is chunked precisely so a fresh frame is inferred
