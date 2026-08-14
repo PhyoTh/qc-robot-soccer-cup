@@ -318,9 +318,17 @@ SCORING_LOST_WITHIN_TICKS = 4      # ball must vanish within this many ticks of 
 # Tune it on the field: run it, watch where the robot ends up, adjust.
 # Set OPENING_SEQUENCE = [] to disable the opening entirely.
 # MEASURED FIELD GEOMETRY (given by the team, Aug 14):
-#   - strafing LEFT ~6 inches puts the robot in front of the goal
+#   - strafing sideways ~6 inches puts the robot in front of the goal
 #   - from there the ball sits ~15 inches directly ahead
-OPENING_LEFT_INCHES = 6.0
+#
+# WHICH WAY IS SIDEWAYS depends on the field: on some the robot starts in the
+# RIGHT corner (strafe left to centre up), on others the LEFT corner (strafe
+# right). The referee's placement decides it, so this is set per match, not
+# baked in - see set_opening_corner() and main.py's START_CORNER env var.
+# Getting it backwards drives AWAY from the goal into the corner, so check it
+# every round the same way you check the team colour.
+OPENING_START_CORNER = "right"  # "right" -> strafe left; "left" -> strafe right
+OPENING_SIDEWAYS_INCHES = 6.0
 OPENING_FORWARD_INCHES = 15.0
 
 # Speeds used for the opening burst. Higher = faster to the ball but less
@@ -343,16 +351,39 @@ FORWARD_MS_PER_INCH = 55.0
 # risks knocking the ball somewhere random before we ever see it.
 OPENING_FORWARD_STOP_SHORT_INCHES = 4.0
 
-OPENING_SEQUENCE = [
-    # Strafe off the corner, onto the goal-to-goal line.
-    ("left", OPENING_STRAFE_SPEED, int(OPENING_LEFT_INCHES * STRAFE_MS_PER_INCH)),
-    # Burst down that line toward the ball, stopping short of it.
-    (
-        "forward",
-        OPENING_FORWARD_SPEED,
-        int(max(OPENING_FORWARD_INCHES - OPENING_FORWARD_STOP_SHORT_INCHES, 1) * FORWARD_MS_PER_INCH),
-    ),
-]
+def _build_opening(corner: str):
+    """Compute the opening burst for a given starting corner.
+
+    Starting in the RIGHT corner means strafing LEFT to reach the goal line,
+    and vice versa - so the sideways step is mirrored while the forward step
+    is unchanged.
+    """
+    sideways = "left" if corner == "right" else "right"
+    forward_inches = max(OPENING_FORWARD_INCHES - OPENING_FORWARD_STOP_SHORT_INCHES, 1)
+    return [
+        # Strafe off the corner, onto the goal-to-goal line.
+        (sideways, OPENING_STRAFE_SPEED, int(OPENING_SIDEWAYS_INCHES * STRAFE_MS_PER_INCH)),
+        # Burst down that line toward the ball, stopping short of it.
+        ("forward", OPENING_FORWARD_SPEED, int(forward_inches * FORWARD_MS_PER_INCH)),
+    ]
+
+
+OPENING_SEQUENCE = _build_opening(OPENING_START_CORNER)
+
+
+def set_opening_corner(corner: str) -> None:
+    """Point the opening at the corner the referee actually placed us in.
+
+    Call before the match (main.py does this from the START_CORNER env var).
+    Rebuilds OPENING_SEQUENCE in place so already-constructed policies, which
+    read the module-level list each tick, pick the change up immediately.
+    """
+    global OPENING_START_CORNER, OPENING_SEQUENCE
+    corner = corner.strip().lower()
+    if corner not in ("left", "right"):
+        raise ValueError(f"corner must be 'left' or 'right', got {corner!r}")
+    OPENING_START_CORNER = corner
+    OPENING_SEQUENCE[:] = _build_opening(corner)
 # Abort the opening if a "robot" detection is at least this wide - an opponent
 # charging the same spot. Bbox-only on purpose: the ultrasonic sensor is dead
 # on this chassis, so proximity has to come from the camera.
