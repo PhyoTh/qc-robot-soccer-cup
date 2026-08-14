@@ -14,7 +14,7 @@ will during a live 5-minute match.
 This file runs a single SoccerPolicy through a scripted ~13-tick "story":
 search (biased, alternating) -> find the ball -> chase it -> get cut off by
 an opponent at EMERGENCY range (retreat) -> find the ball again but no goal
-is visible yet (possession-safe peek, not a blind push) -> get faked out by
+is readable yet (possession-safe peek, not a blind push) -> get faked out by
 our own goal -> score on the opponent's goal -> get contested by an opponent
 at ordinary range (juke sideways, NOT retreat - this is the exploit fix) ->
 lose the ball long enough to exhaust the coast window -> search resumes,
@@ -139,17 +139,22 @@ def run_story() -> None:
         [],                                             # 2: still nothing
         [ball_far_left],                                 # 3: ball appears, off-centre
         [ball_far_left, opponent_emergency],              # 4: opponent right on top of us - EMERGENCY
-        [ball_centered_far],                              # 5: ball re-found, centred, but no goal visible yet
-        [ball_centered_close, own_goal_box],               # 6: closing in, but the goal ahead is OURS
-        [ball_centered_close, opp_goal_box],               # 7: same spot, goal ahead is the OPPONENT'S - score
+        [ball_centered_far],                              # 5: ball re-found and centred, but the tape is unreadable
+        [ball_centered_close, own_goal_box],               # 6: closing in, and the end ahead is OURS
+        [ball_centered_close, opp_goal_box],               # 7: same spot, end ahead is the OPPONENT'S - score
         [ball_centered_close, opponent_contested],          # 8: opponent contests at ORDINARY range - juke, don't retreat
     ] + [[]] * (COAST_TICKS + 1)  # 9..12+: ball gone long enough to exhaust the coast window -> search
 
-    # classify() is only called on ticks where a "goal" detection is present
-    # (ticks 6 and 7 above) - every other tick never touches this list.
+    # classify() is called on every tick that REACHES the scoring decision -
+    # i.e. ball tracking AND centred - regardless of whether a goal was
+    # detected (soccer_policy design note 7). That is ticks 5, 6 and 7 here;
+    # ticks 1-4 return earlier (searching / aiming / opponent emergency) and
+    # ticks 8+ do too (opponent contest, then ball lost), so they never
+    # consume from this list.
     wall_script = [
-        "OWN SIDE",        # tick 6: goal in view is ours -> must not push
-        "OPPONENT SIDE",   # tick 7: goal in view is theirs -> push through
+        "UNKNOWN",         # tick 5: tape not readable from here -> possession-safe peek
+        "OWN SIDE",        # tick 6: end ahead is ours -> must not push
+        "OPPONENT SIDE",   # tick 7: end ahead is theirs -> push through
     ]
 
     robot = _RecordingRobot()
@@ -175,18 +180,18 @@ def run_story() -> None:
     print("[SIM] tick 4: opponent EMERGENCY-close -> back off, ball is ignored entirely")
     assert tick({"program_enabled": True, "ultrasonic_mm": 80}) == ("drive", "backward", APPROACH_SPEED, DRIVE_MS)
 
-    print("[SIM] tick 5: ball re-found and centred, but NO goal visible yet -> possession-safe peek, not a blind push")
+    print("[SIM] tick 5: ball re-found and centred, but the tape is UNREADABLE -> possession-safe peek, not a blind push")
     action = tick()
     assert action[0] == "drive" and action[1] in ("left", "right"), action
     assert action[2:] == (POSSESSION_SCAN_SPEED, POSSESSION_SCAN_TURN_MS), (
         "must be the gentle possession-safe peek, not a full push or a full search", action
     )
 
-    print("[SIM] tick 6: ball centred + close + OUR goal behind it -> peel off, never forward")
+    print("[SIM] tick 6: ball centred + close + OUR end ahead -> peel off, never forward")
     action = tick()
     assert action == ("drive", "right", SEARCH_SPEED, TURN_MS), action
 
-    print("[SIM] tick 7: ball centred + close + OPPONENT goal behind it -> push through")
+    print("[SIM] tick 7: ball centred + close + OPPONENT end ahead -> push through")
     action = tick()
     expected_speed = max(int(APPROACH_SPEED * (1.0 - ball_centered_close.width / FRAME.shape[1])), MIN_APPROACH_SPEED)
     assert action == ("drive", "forward", expected_speed, DRIVE_MS), action

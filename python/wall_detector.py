@@ -100,22 +100,50 @@ class WallSideDetector:
         self.min_tape_px = min_tape_px
         self.band_top_frac = band_top_frac
         self.band_bottom_frac = band_bottom_frac
+        # Preallocated HSV bounds - analyze() runs on every tick that reaches
+        # the policy's scoring decision, so avoid rebuilding six small numpy
+        # arrays per call. Mutated in place by _masks(); not thread-safe, which
+        # is fine - the policy loop is single-threaded by construction.
+        if np is not None:
+            (r0_lo, r0_hi), (r1_lo, r1_hi) = RED_HUE_RANGES
+            b_lo, b_hi = BLUE_HUE_RANGE
+            self._lo = np.array([0, sat_min, val_min], dtype=np.uint8)
+            self._hi = np.array([0, 255, 255], dtype=np.uint8)
+            self._hue_bounds = ((r0_lo, r0_hi), (r1_lo, r1_hi), (b_lo, b_hi))
+            self._col_idx = None  # lazily sized to frame width, reused after
 
     def _masks(self, hsv):
-        lo_sv = np.array([0, self.sat_min, self.val_min])
-        hi_sv = np.array([0, 255, 255])
+        """Red/blue masks for an already-cropped HSV band. Mutates the
+        preallocated bound arrays in place rather than rebuilding them."""
+        lo, hi = self._lo, self._hi
+        (r0_lo, r0_hi), (r1_lo, r1_hi), (b_lo, b_hi) = self._hue_bounds
 
-        (r0_lo, r0_hi), (r1_lo, r1_hi) = RED_HUE_RANGES
-        lo_sv[0], hi_sv[0] = r0_lo, r0_hi
-        red_mask_a = cv2.inRange(hsv, lo_sv, hi_sv)
-        lo_sv[0], hi_sv[0] = r1_lo, r1_hi
-        red_mask_b = cv2.inRange(hsv, lo_sv, hi_sv)
-        red_mask = cv2.bitwise_or(red_mask_a, red_mask_b)
+        lo[0], hi[0] = r0_lo, r0_hi
+        red_mask = cv2.inRange(hsv, lo, hi)
+        lo[0], hi[0] = r1_lo, r1_hi
+        # in-place OR into red_mask - saves allocating a third mask per call
+        cv2.bitwise_or(red_mask, cv2.inRange(hsv, lo, hi), dst=red_mask)
 
-        b_lo, b_hi = BLUE_HUE_RANGE
-        lo_sv[0], hi_sv[0] = b_lo, b_hi
-        blue_mask = cv2.inRange(hsv, lo_sv, hi_sv)
+        lo[0], hi[0] = b_lo, b_hi
+        blue_mask = cv2.inRange(hsv, lo, hi)
         return red_mask, blue_mask
+
+    def _column_stats(self, mask, w: int):
+        """(pixel count, horizontal centroid) for a 0/255 mask.
+
+        Deliberately avoids np.nonzero(), which materialises one int64 index
+        array per matched pixel - on a frame with a lot of tape that is the
+        single biggest allocation in this function. Summing down columns
+        first collapses the work to O(width) and keeps it inside OpenCV."""
+        col = cv2.reduce(mask, 0, cv2.REDUCE_SUM, dtype=cv2.CV_32S).reshape(-1)
+        total = int(col.sum())
+        if total == 0:
+            return 0, None
+        if self._col_idx is None or self._col_idx.shape[0] != w:
+            self._col_idx = np.arange(w, dtype=np.float64)
+        # The 255 scaling cancels in the weighted mean, so no need to divide it out.
+        centroid = float(col.dot(self._col_idx) / total)
+        return total // 255, centroid
 
     def analyze(self, frame_bgr) -> dict:
         """Decide which end of the field the camera faces. See the module
@@ -129,28 +157,31 @@ class WallSideDetector:
         if frame_bgr is None or frame_bgr.size == 0:
             return empty
 
-        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        h, w = hsv.shape[0], hsv.shape[1]
+        h, w = frame_bgr.shape[0], frame_bgr.shape[1]
         if h == 0 or w == 0:
             return empty
 
-        red_mask, blue_mask = self._masks(hsv)
-
-        # Restrict the decision to the wall band - ceiling and floor carry no
-        # tape and only add noise. Guard against a degenerate band on very
-        # short frames (the synthetic self-test frames below are 40px tall).
+        # Crop to the wall band BEFORE any per-pixel work. Ceiling and floor
+        # carry no tape, so converting and thresholding them is pure waste -
+        # and with the default 20-60% band that is 60% of the frame skipped
+        # in both cvtColor and inRange, the two dominant costs here. Slicing a
+        # numpy array is a view, so the crop itself is free.
+        # Guard against a degenerate band on very short frames (the synthetic
+        # self-test frames below are 40px tall).
         y0 = min(int(h * self.band_top_frac), max(h - 1, 0))
         y1 = max(int(h * self.band_bottom_frac), y0 + 1)
-        red_band, blue_band = red_mask[y0:y1], blue_mask[y0:y1]
+        band_bgr = frame_bgr[y0:y1]
+
+        hsv = cv2.cvtColor(band_bgr, cv2.COLOR_BGR2HSV)
+        red_band, blue_band = self._masks(hsv)
 
         band_px = red_band.shape[0] * red_band.shape[1]
-        red_xs = np.nonzero(red_band)[1]
-        blue_xs = np.nonzero(blue_band)[1]
-        red_px, blue_px = int(red_xs.size), int(blue_xs.size)
+        red_px, red_cx = self._column_stats(red_band, w)
+        blue_px, blue_cx = self._column_stats(blue_band, w)
 
         center_x = w / 2.0
-        red_offset = float(abs(red_xs.mean() - center_x)) if red_px else None
-        blue_offset = float(abs(blue_xs.mean() - center_x)) if blue_px else None
+        red_offset = abs(red_cx - center_x) if red_cx is not None else None
+        blue_offset = abs(blue_cx - center_x) if blue_cx is not None else None
 
         red_seen = red_px >= self.min_tape_px
         blue_seen = blue_px >= self.min_tape_px
