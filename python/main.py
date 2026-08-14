@@ -248,6 +248,21 @@ def main() -> None:
     print("   Check this before EVERY round - the ref can reassign it.")
     print("=" * 58)
 
+    # Which corner the referee placed us in decides which way the kickoff
+    # burst strafes. Backwards means driving into the corner instead of onto
+    # the goal line, so it is banner-printed alongside the team colour.
+    import soccer_policy as _sp
+    corner = os.environ.get("START_CORNER", _sp.OPENING_START_CORNER).strip().lower()
+    try:
+        _sp.set_opening_corner(corner)
+    except ValueError as exc:
+        print(f"[WARN] {exc} - keeping {_sp.OPENING_START_CORNER}")
+    if _sp.OPENING_SEQUENCE:
+        _side, _spd, _ms = _sp.OPENING_SEQUENCE[0]
+        print(f"   START CORNER = {_sp.OPENING_START_CORNER.upper()}  -> opening strafes {_side.upper()} ({_ms}ms)")
+        print("   Wrong? re-run with START_CORNER=left  (or =right)")
+        print("=" * 58)
+
     if not sensors.get("line_ok"):
         print("[WARN] line sensor unavailable - precision course will not work, match play is unaffected")
     if sensors.get("ultrasonic_mm", -1) <= 0:
