@@ -343,13 +343,40 @@ OPENING_FORWARD_SPEED = 220
 # typically slower per-inch than driving forward, which is why they differ.
 # Getting these right is the single highest-value tuning step for the
 # opening, because everything below is computed from them.
-STRAFE_MS_PER_INCH = 75.0
-FORWARD_MS_PER_INCH = 55.0
+# MEASURED on the field Aug 14 with calibrate_motion.py, at the speeds above.
+STRAFE_MS_PER_INCH = 100.0
+FORWARD_MS_PER_INCH = 100.0
+
+# The forward burst is split into chunks of at most this many milliseconds,
+# with a full Acquire->Infer cycle between each one. At 100 ms/inch the
+# approach is ~1100ms, and driving that as a single blocking pulse would mean
+# a full second of not looking - straight past the ball if it has rolled off
+# the expected line. Chunking trades a little speed (drive() adds ~100ms of
+# settle per call) for the ability to spot the ball mid-approach and hand
+# over to the real closed-loop chase. 300ms is roughly 3 inches of travel
+# between looks.
+OPENING_CHUNK_MS = 300
 
 # Stop short of the ball rather than driving through where it sits: the
 # normal closed-loop chase should make the final approach, and overshooting
 # risks knocking the ball somewhere random before we ever see it.
 OPENING_FORWARD_STOP_SHORT_INCHES = 4.0
+
+def _chunked(direction: str, speed: int, total_ms: int):
+    """Split one long move into OPENING_CHUNK_MS-sized steps.
+
+    Each step is a separate policy tick, so a fresh camera frame is inferred
+    between them - that is what stops the opening from driving blind past a
+    ball that isn't exactly where we assumed.
+    """
+    steps = []
+    remaining = max(int(total_ms), 0)
+    while remaining > 0:
+        piece = min(remaining, OPENING_CHUNK_MS)
+        steps.append((direction, speed, piece))
+        remaining -= piece
+    return steps
+
 
 def _build_opening(corner: str):
     """Compute the opening burst for a given starting corner.
@@ -360,12 +387,12 @@ def _build_opening(corner: str):
     """
     sideways = "left" if corner == "right" else "right"
     forward_inches = max(OPENING_FORWARD_INCHES - OPENING_FORWARD_STOP_SHORT_INCHES, 1)
-    return [
+    return (
         # Strafe off the corner, onto the goal-to-goal line.
-        (sideways, OPENING_STRAFE_SPEED, int(OPENING_SIDEWAYS_INCHES * STRAFE_MS_PER_INCH)),
-        # Burst down that line toward the ball, stopping short of it.
-        ("forward", OPENING_FORWARD_SPEED, int(forward_inches * FORWARD_MS_PER_INCH)),
-    ]
+        _chunked(sideways, OPENING_STRAFE_SPEED, OPENING_SIDEWAYS_INCHES * STRAFE_MS_PER_INCH)
+        # Then advance down that line toward the ball, looking between chunks.
+        + _chunked("forward", OPENING_FORWARD_SPEED, forward_inches * FORWARD_MS_PER_INCH)
+    )
 
 
 OPENING_SEQUENCE = _build_opening(OPENING_START_CORNER)
@@ -1118,6 +1145,31 @@ if __name__ == "__main__":
         f"after the opening the normal search should take over, got {robot.calls[-1]}"
     )
     print(f"  -> ran {len(OPENING_SEQUENCE)} opening step(s), then normal search")
+
+    print("[SELF-TEST] NEW: opening spots the ball MID-APPROACH and stops driving blind")
+    # The forward burst is chunked precisely so a fresh frame is inferred
+    # between pieces. Drive a few chunks with nothing in view, then reveal the
+    # ball part-way through: it must abandon the rest of the burst that same
+    # tick rather than finishing a pre-planned drive past it.
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    empty_det = _FakeDetector([])
+    for _ in range(3):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, empty_det, wall_unknown, hold_toggle=False)
+    steps_used = policy._opening_step
+    assert steps_used < len(OPENING_SEQUENCE), "test needs steps remaining to prove early exit"
+    side_ball = _FakeDetection("soccer_ball", 0.9, x=20, y=150, width=20, height=20)  # well off to the left
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([side_ball]), wall_unknown, hold_toggle=False)
+    assert policy._opening_step >= len(OPENING_SEQUENCE), (
+        f"seeing the ball must abandon the remaining {len(OPENING_SEQUENCE) - steps_used} opening step(s)"
+    )
+    assert robot.calls[-1][1] == "rotate_left", (
+        f"expected the normal chase to turn toward the ball, got {robot.calls[-1]}"
+    )
+    print(
+        f"  -> after {steps_used}/{len(OPENING_SEQUENCE)} chunks the ball appeared; "
+        f"burst abandoned and it turned to chase ({robot.calls[-1][1]})"
+    )
 
     print("[SELF-TEST] NEW: opening ABORTS if an opponent is charging the same spot (collision risk)")
     robot = _FakeRobot()
