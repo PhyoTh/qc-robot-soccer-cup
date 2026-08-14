@@ -148,7 +148,14 @@ def check_wall(cap, seconds: float) -> None:
         return
 
     if reads > 0:
-        _pass(f"{reads} live read(s) completed - if red=/blue=% look wrong for what's actually visible, retune sat_min/val_min/min_coverage_pct in wall_detector.py")
+        _pass(
+            f"{reads} live read(s) completed - point the camera at a KNOWN end and check the "
+            f"'facing' verdict, not the percentages. The verdict comes from which colour's "
+            f"off= (centroid distance from frame centre) is SMALLER; percentages only show "
+            f"whether tape was seen at all. If tape is visible but both px counts are ~0, "
+            f"loosen sat_min/val_min; if the verdict is wrong while both colours are seen, "
+            f"check band_top_frac/band_bottom_frac in wall_detector.py."
+        )
     else:
         _fail("no frames read during the calibration window")
 
