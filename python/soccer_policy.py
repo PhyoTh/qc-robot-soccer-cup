@@ -395,7 +395,16 @@ OPENING_CHUNK_MS = 300
 # Deliberately only applied while SEARCHING. During ball chase a big tape
 # reading is normal and expected (the ball is often near a wall), and
 # reversing there would abandon the ball.
-WALL_STUCK_COVERAGE_PCT = 30.0
+# DISABLED (set above any reachable coverage) after it regressed on the field.
+# The threshold assumed a wall only fills the frame when you are pressed
+# against it, but this field carries tape along the full length of BOTH side
+# walls, so ordinary positions clear 30% easily - which made the robot back up
+# every search tick instead of rotating, i.e. exactly the "won't turn to find
+# the ball" symptom it was meant to prevent. Needs a real proximity signal
+# (the ultrasonic, if it ever gets fixed) rather than tape area. Set back to
+# ~30.0 only with measurements showing tape coverage genuinely separates
+# "against a wall" from "normal play".
+WALL_STUCK_COVERAGE_PCT = 999.0
 # Only after the search has already failed for a while - a brief glimpse of
 # wall mid-sweep is not stuck, it is just part of turning around.
 WALL_STUCK_AFTER_TICKS = 6
@@ -1279,7 +1288,7 @@ if __name__ == "__main__":
     )
     print(f"  -> ran {len(OPENING_SEQUENCE)} opening step(s), then normal search")
 
-    print("[SELF-TEST] NEW: backs off a wall that fills the view during a prolonged search")
+    print("[SELF-TEST] a wall filling the view must NOT stop the search sweep (unstick disabled)")
 
     class _WallHeavyDetector:
         """Wall detector stand-in reporting the frame is mostly tape - what
@@ -1300,18 +1309,17 @@ if __name__ == "__main__":
     policy._opening_step = len(OPENING_SEQUENCE)  # not what this test is about
     wall_heavy = _WallHeavyDetector()
     empty = _FakeDetector([])
-    # Early ticks: a bit of wall in view is normal mid-sweep, keep rotating.
-    for _ in range(WALL_STUCK_AFTER_TICKS):
+    # The unstick is DISABLED (WALL_STUCK_COVERAGE_PCT raised out of reach)
+    # because tape lines the full length of both side walls here, so ordinary
+    # positions cleared the old 30% bar and the robot reversed every search
+    # tick instead of turning. What must hold now is that a wall-heavy frame
+    # NEVER interrupts the sweep - searching must keep rotating regardless.
+    for _ in range(WALL_STUCK_AFTER_TICKS + 5):
         policy.decide_and_act(FRAME, ENABLED_SENSORS, empty, wall_heavy, hold_toggle=False)
         assert robot.calls[-1][1].startswith("rotate"), (
-            f"should still be sweeping this early, got {robot.calls[-1]}"
+            f"a wall-heavy frame must not stop the search sweep, got {robot.calls[-1]}"
         )
-    # Past the grace period with the wall still filling the frame -> back off.
-    policy.decide_and_act(FRAME, ENABLED_SENSORS, empty, wall_heavy, hold_toggle=False)
-    assert robot.calls[-1] == ("drive", "backward", WALL_BACKUP_SPEED, WALL_BACKUP_MS), (
-        f"expected a back-off once wedged against the wall, got {robot.calls[-1]}"
-    )
-    print(f"  -> swept {WALL_STUCK_AFTER_TICKS} ticks, then backed off: {robot.calls[-1]}")
+    print(f"  -> kept sweeping through {WALL_STUCK_AFTER_TICKS + 5} wall-heavy ticks (unstick disabled)")
 
     print("[SELF-TEST] NEW: a wall in view does NOT interrupt an active ball chase")
     # Tape filling the frame is normal when the ball is near a wall - reversing
