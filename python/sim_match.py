@@ -177,9 +177,12 @@ def run_story() -> None:
     first_search = tick()
     assert first_search[0] == "drive" and first_search[1] in ("rotate_left", "rotate_right"), first_search
 
-    print("[SIM] tick 2: still no ball -> search the OTHER direction (alternation)")
+    print("[SIM] tick 2: still no ball -> keeps sweeping the SAME way (not jittering)")
     second_search = tick()
-    assert second_search[1] != first_search[1], (first_search, second_search)
+    # Search holds a direction for SEARCH_SWEEP_TICKS before reversing.
+    # Flipping every tick was the field-observed jitter bug: the robot
+    # oscillated around one heading and never looked anywhere new.
+    assert second_search[1] == first_search[1], (first_search, second_search)
 
     print("[SIM] tick 3: ball far left -> turn toward it")
     assert tick() == ("drive", "rotate_left", APPROACH_SPEED, TURN_MS)

@@ -272,6 +272,18 @@ DEWEDGE_MS = 200
 SEARCH_ESCALATE_AFTER_TICKS = 15
 SEARCH_WIDEN_EVERY_TICKS = 5
 
+# How many consecutive ticks to keep rotating the SAME way before reversing.
+# This exists because the original code flipped direction every single tick,
+# which looked like a sensible "don't spin one way forever" guard but actually
+# meant the robot oscillated around one heading - observed on the field as
+# jittering in place rather than searching. It never pointed anywhere new, so
+# it could not find a ball that wasn't already in front of it.
+#
+# Sweeping in blocks fixes it: 6 ticks x 200ms of continuous rotation is a
+# real arc, then it reverses and sweeps back across the other side. The
+# alternation still prevents spinning endlessly in one direction.
+SEARCH_SWEEP_TICKS = 6
+
 # --- Goal-scored heuristic (drives the celebration) -------------------------
 # There is no score sensor, so "did we score?" has to be inferred. The signal
 # used is: we were pushing a CLOSE ball at a POSITIVELY CONFIRMED opponent
@@ -385,6 +397,12 @@ WALL_BACKUP_MS = 350
 # risks knocking the ball somewhere random before we ever see it.
 OPENING_FORWARD_STOP_SHORT_INCHES = 4.0
 
+# One extra forward pulse appended to the burst, added after watching it live:
+# it was stopping just shy of the ball rather than making contact. Kept as a
+# separate tack-on rather than folded into the inches above so it stays easy
+# to drop back out if it turns out to overshoot on a different field.
+OPENING_EXTRA_FORWARD_MS = 200
+
 def _chunked(direction: str, speed: int, total_ms: int):
     """Split one long move into OPENING_CHUNK_MS-sized steps.
 
@@ -415,6 +433,8 @@ def _build_opening(corner: str):
         _chunked(sideways, OPENING_STRAFE_SPEED, OPENING_SIDEWAYS_INCHES * STRAFE_MS_PER_INCH)
         # Then advance down that line toward the ball, looking between chunks.
         + _chunked("forward", OPENING_FORWARD_SPEED, forward_inches * FORWARD_MS_PER_INCH)
+        # Plus one more nudge to actually reach the ball - see above.
+        + _chunked("forward", OPENING_FORWARD_SPEED, OPENING_EXTRA_FORWARD_MS)
     )
 
 
@@ -546,6 +566,7 @@ class SoccerPolicy:
         where the ball used to be) is worse than just starting fresh."""
         self._tracker = _BallTracker()
         self._search_turn_left_next: Optional[bool] = None  # seeded from last-known side on each fresh loss
+        self._search_sweep_ticks = 0  # see SEARCH_SWEEP_TICKS
         self._scan_turn_left_next = True  # alternates the possession-safe "peek" turn
         self._possession_scan_ticks = 0
         self._consecutive_push_ticks = 0  # see DEWEDGE_PUSH_TICKS
@@ -655,8 +676,14 @@ class SoccerPolicy:
             self._last_goal_side = None  # ball itself is gone, not just occluded - don't trust old goal memory
             if self._search_turn_left_next is None:
                 self._search_turn_left_next = self._tracker.last_known_side_left(frame_w)
+                self._search_sweep_ticks = 0
             direction = "rotate_left" if self._search_turn_left_next else "rotate_right"
-            self._search_turn_left_next = not self._search_turn_left_next
+            # Hold the same direction for a whole sweep before reversing. See
+            # SEARCH_SWEEP_TICKS - flipping every tick just jitters in place.
+            self._search_sweep_ticks += 1
+            if self._search_sweep_ticks >= SEARCH_SWEEP_TICKS:
+                self._search_turn_left_next = not self._search_turn_left_next
+                self._search_sweep_ticks = 0
 
             ticks_lost = self._tracker.ticks_since_seen
 
@@ -1148,6 +1175,31 @@ if __name__ == "__main__":
     assert last[1] not in ("backward",), f"a distant opponent must not trigger any contact response, got {last}"
     print(f"  -> {last}  (a merely-visible opponent doesn't spook the policy)")
 
+    print("[SELF-TEST] NEW: search SWEEPS in one direction, it does not jitter tick-to-tick")
+    # Observed on the field: the robot "jittered" instead of searching. Cause
+    # was flipping rotation direction every single tick, so it oscillated
+    # around one heading and never pointed anywhere new - it could only ever
+    # find a ball that was already in front of it.
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    policy._opening_step = len(OPENING_SEQUENCE)
+    nothing = _FakeDetector([])
+    for _ in range(SEARCH_SWEEP_TICKS):
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, nothing, wall_unknown, hold_toggle=False)
+    first_sweep = [c[1] for c in robot.calls]
+    assert len(set(first_sweep)) == 1, (
+        f"a sweep must hold ONE direction for {SEARCH_SWEEP_TICKS} ticks, got {first_sweep}"
+    )
+    # Next tick must reverse, so the sweep covers the other side too.
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, nothing, wall_unknown, hold_toggle=False)
+    assert robot.calls[-1][1] != first_sweep[0], (
+        f"after {SEARCH_SWEEP_TICKS} ticks it must reverse, got {robot.calls[-1][1]} again"
+    )
+    print(
+        f"  -> {SEARCH_SWEEP_TICKS}x {first_sweep[0]} "
+        f"({SEARCH_SWEEP_TICKS * TURN_MS}ms of continuous rotation), then reversed to {robot.calls[-1][1]}"
+    )
+
     print("[SELF-TEST] no ball detected at all (never seen) -> search, arbitrary default side")
     robot = _FakeRobot()
     policy = SoccerPolicy(robot)
@@ -1162,8 +1214,13 @@ if __name__ == "__main__":
     assert first_dir.startswith("rotate") and second_dir.startswith("rotate"), (
         f"expected two search rotations, got {robot.calls}"
     )
-    assert first_dir != second_dir, robot.calls
-    print(f"  -> {first_dir} then {second_dir}  (alternates so it doesn't spin one way forever)")
+    # Consecutive ticks now hold the SAME direction - that is the sweep fix.
+    # Reversing every tick was the jitter bug; the reversal is asserted in the
+    # dedicated sweep test above.
+    assert first_dir == second_dir, (
+        f"consecutive search ticks must sweep the same way, not flip - got {robot.calls}"
+    )
+    print(f"  -> {first_dir} held across consecutive ticks (sweeping, not jittering)")
 
     print("[SELF-TEST] program disabled -> no action at all")
     robot = _FakeRobot()
