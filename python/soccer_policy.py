@@ -282,7 +282,17 @@ SEARCH_WIDEN_EVERY_TICKS = 5
 # Sweeping in blocks fixes it: 6 ticks x 200ms of continuous rotation is a
 # real arc, then it reverses and sweeps back across the other side. The
 # alternation still prevents spinning endlessly in one direction.
-SEARCH_SWEEP_TICKS = 6
+#
+# SET GENEROUSLY ON PURPOSE. Nobody has measured how many degrees one 200ms
+# pulse at SEARCH_SPEED actually turns this chassis, and the failure modes are
+# lopsided: too FEW ticks sweeps a narrow wedge, reverses, and re-scans the
+# same wedge forever - a ball behind the robot is never found, which looks
+# almost as broken as the jitter this replaced. Too MANY just means it rotates
+# past the ball and comes back around on the next pass, costing a second.
+# 15 x 200ms = 3s of continuous rotation, which should comfortably exceed a
+# full circle. Lower it only after watching a real sweep and seeing it
+# overshoot badly.
+SEARCH_SWEEP_TICKS = 15
 
 # --- Goal-scored heuristic (drives the celebration) -------------------------
 # There is no score sensor, so "did we score?" has to be inferred. The signal
@@ -1199,6 +1209,30 @@ if __name__ == "__main__":
         f"  -> {SEARCH_SWEEP_TICKS}x {first_sweep[0]} "
         f"({SEARCH_SWEEP_TICKS * TURN_MS}ms of continuous rotation), then reversed to {robot.calls[-1][1]}"
     )
+
+    print("[SELF-TEST] NEW: mid-sweep, the instant the ball appears it stops searching and chases")
+    robot = _FakeRobot()
+    policy = SoccerPolicy(robot)
+    policy._opening_step = len(OPENING_SEQUENCE)
+    nothing = _FakeDetector([])
+    for _ in range(3):  # part-way through a sweep, still searching
+        policy.decide_and_act(FRAME, ENABLED_SENSORS, nothing, wall_unknown, hold_toggle=False)
+    assert robot.calls[-1][2:] == (SEARCH_SPEED, TURN_MS), f"should be searching, got {robot.calls[-1]}"
+    # Ball comes into view off to the right - must abandon the sweep and aim at it.
+    right_ball = _FakeDetection("soccer_ball", 0.9, x=290, y=150, width=20, height=20)  # centre_x=300
+    policy.decide_and_act(FRAME, ENABLED_SENSORS, _FakeDetector([right_ball]), wall_unknown, hold_toggle=False)
+    assert robot.calls[-1] == ("drive", "rotate_right", APPROACH_SPEED, TURN_MS), (
+        f"expected an aiming turn TOWARD the ball at chase speed, got {robot.calls[-1]}"
+    )
+    # ...and then close on it once centred.
+    centred = _FakeDetection("soccer_ball", 0.9, x=150, y=150, width=40, height=40)
+    _goal_ahead = _FakeDetection("goal", 0.9, x=100, y=20, width=120, height=60)
+    policy.decide_and_act(
+        FRAME, ENABLED_SENSORS, _FakeDetector([centred, _goal_ahead]),
+        _FakeWallDetector("OPPONENT SIDE"), hold_toggle=False,
+    )
+    assert robot.calls[-1][1] == "forward", f"expected a push once centred, got {robot.calls[-1]}"
+    print(f"  -> search -> aim ({robot.calls[-2][1]}) -> push ({robot.calls[-1][1]}) with no gap")
 
     print("[SELF-TEST] no ball detected at all (never seen) -> search, arbitrary default side")
     robot = _FakeRobot()
