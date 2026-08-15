@@ -182,7 +182,10 @@ FRAME_STALE_SEC = 0.75
 CENTER_DEADZONE_FRAC = 0.12
 
 APPROACH_SPEED = 150   # matches main.py's default drive() speed
-SEARCH_SPEED = 120     # slower scan speed while genuinely searching
+# Raised from 120 after watching a real sweep: 120 turned the chassis too
+# weakly/slowly to sweep the field in a useful amount of time. Searching is
+# not a delicate manoeuvre - it wants to cover ground.
+SEARCH_SPEED = 180
 MIN_APPROACH_SPEED = 80  # floor so the final-approach slowdown never stalls the motors
 
 TURN_MS = 200   # bounded rotate pulse (aim / search)
@@ -269,8 +272,19 @@ DEWEDGE_MS = 200
 # with an occasional strafe if a search has genuinely been failing for a
 # while, matching the "patrol wider when initial search fails" approach
 # documented for RoboCup Junior Soccer ball recovery.
+# Search turns ONE WAY and keeps going, rather than sweeping back and forth.
+# Continuous rotation covers a full circle on its own, so every position is
+# swept anyway - and committing to one direction is simpler to watch, simpler
+# to reason about, and never re-scans the wedge it just cleared. Set to
+# "rotate_left" if the robot turns the wrong way for your taste; set to None
+# to restore the old alternating sweep.
+SEARCH_DIRECTION = "rotate_right"  # clockwise viewed from above
+
 SEARCH_ESCALATE_AFTER_TICKS = 15
-SEARCH_WIDEN_EVERY_TICKS = 5
+# Widening the search with sideways strafes is DISABLED: with continuous
+# one-way rotation the robot already sees every heading, so the strafe added
+# nothing except a chance to scrape a wall. Set to 5 to bring it back.
+SEARCH_WIDEN_EVERY_TICKS = 10 ** 9
 
 # How many consecutive ticks to keep rotating the SAME way before reversing.
 # This exists because the original code flipped direction every single tick,
@@ -693,16 +707,22 @@ class SoccerPolicy:
             # Check BEFORE clearing goal memory - the check reads it.
             self._maybe_goal_scored()
             self._last_goal_side = None  # ball itself is gone, not just occluded - don't trust old goal memory
-            if self._search_turn_left_next is None:
-                self._search_turn_left_next = self._tracker.last_known_side_left(frame_w)
-                self._search_sweep_ticks = 0
-            direction = "rotate_left" if self._search_turn_left_next else "rotate_right"
-            # Hold the same direction for a whole sweep before reversing. See
-            # SEARCH_SWEEP_TICKS - flipping every tick just jitters in place.
-            self._search_sweep_ticks += 1
-            if self._search_sweep_ticks >= SEARCH_SWEEP_TICKS:
-                self._search_turn_left_next = not self._search_turn_left_next
-                self._search_sweep_ticks = 0
+            if SEARCH_DIRECTION is not None:
+                # Committed one-way rotation - see SEARCH_DIRECTION. A full
+                # turn covers every heading, so there is nothing to alternate
+                # for and no wedge to re-scan.
+                direction = SEARCH_DIRECTION
+            else:
+                if self._search_turn_left_next is None:
+                    self._search_turn_left_next = self._tracker.last_known_side_left(frame_w)
+                    self._search_sweep_ticks = 0
+                direction = "rotate_left" if self._search_turn_left_next else "rotate_right"
+                # Hold one direction for a whole sweep before reversing - see
+                # SEARCH_SWEEP_TICKS; flipping every tick just jitters in place.
+                self._search_sweep_ticks += 1
+                if self._search_sweep_ticks >= SEARCH_SWEEP_TICKS:
+                    self._search_turn_left_next = not self._search_turn_left_next
+                    self._search_sweep_ticks = 0
 
             ticks_lost = self._tracker.ticks_since_seen
 
@@ -736,7 +756,8 @@ class SoccerPolicy:
                 self.robot.drive(strafe_direction, speed=SEARCH_SPEED, ms=TURN_MS)
                 return
 
-            print(f"[POLICY] ball lost - searching {direction} (biased from last known side)")
+            _why = "committed" if SEARCH_DIRECTION is not None else "biased from last known side"
+            print(f"[POLICY] ball lost - searching {direction} ({_why})")
             self.robot.drive(direction, speed=SEARCH_SPEED, ms=TURN_MS)
             return
 
@@ -1143,7 +1164,7 @@ if __name__ == "__main__":
     )
     print(f"  -> tick2={action2}  tick3(coasting)={action3}  (kept tracking through a brief occlusion, did not panic-search)")
 
-    print("[SELF-TEST] NEW: hybrid tracking - occlusion outlasts COAST_TICKS -> falls back to search, biased toward last-known side")
+    print("[SELF-TEST] hybrid tracking - occlusion outlasts COAST_TICKS -> falls back to search")
     robot = _FakeRobot()
     policy = SoccerPolicy(robot)
     left_seen = _FakeDetection("soccer_ball", 0.9, x=0, y=150, width=20, height=20)  # last seen well left of centre
@@ -1154,10 +1175,17 @@ if __name__ == "__main__":
         policy.decide_and_act(FRAME, ENABLED_SENSORS, script, wall_unknown, hold_toggle=False)  # still coasting
     policy.decide_and_act(FRAME, ENABLED_SENSORS, script, wall_unknown, hold_toggle=False)  # now fully lost
     last = robot.calls[-1]
-    assert last == ("drive", "rotate_left", SEARCH_SPEED, TURN_MS), (
-        "ball was last seen on the LEFT - the first search guess should be rotate_left, not a coin flip", last
-    )
-    print(f"  -> {last}  (search correctly biased toward the side the ball was last seen on)")
+    assert last[2:] == (SEARCH_SPEED, TURN_MS), f"expected a search rotation, got {last}"
+    if SEARCH_DIRECTION is not None:
+        # Committed one-way rotation: a full turn sees every heading, so the
+        # last-known-side bias is deliberately not used.
+        assert last[1] == SEARCH_DIRECTION, f"search must commit to {SEARCH_DIRECTION}, got {last}"
+        print(f"  -> {last}  (committed one-way search, per SEARCH_DIRECTION)")
+    else:
+        assert last[1] == "rotate_left", (
+            "ball was last seen on the LEFT - the first alternating-search guess should be rotate_left", last
+        )
+        print(f"  -> {last}  (search biased toward the side the ball was last seen on)")
 
     print("[SELF-TEST] opponent EMERGENCY (very close, fills the frame) -> back off")
     robot = _FakeRobot()
@@ -1194,30 +1222,29 @@ if __name__ == "__main__":
     assert last[1] not in ("backward",), f"a distant opponent must not trigger any contact response, got {last}"
     print(f"  -> {last}  (a merely-visible opponent doesn't spook the policy)")
 
-    print("[SELF-TEST] NEW: search SWEEPS in one direction, it does not jitter tick-to-tick")
+    print("[SELF-TEST] search commits to ONE direction, it does not jitter tick-to-tick")
     # Observed on the field: the robot "jittered" instead of searching. Cause
     # was flipping rotation direction every single tick, so it oscillated
     # around one heading and never pointed anywhere new - it could only ever
-    # find a ball that was already in front of it.
+    # find a ball that was already in front of it. Now it commits (see
+    # SEARCH_DIRECTION), or sweeps in long blocks if that is set to None.
     robot = _FakeRobot()
     policy = SoccerPolicy(robot)
     policy._opening_step = len(OPENING_SEQUENCE)
     nothing = _FakeDetector([])
-    for _ in range(SEARCH_SWEEP_TICKS):
+    for _ in range(SEARCH_SWEEP_TICKS + 4):
         policy.decide_and_act(FRAME, ENABLED_SENSORS, nothing, wall_unknown, hold_toggle=False)
-    first_sweep = [c[1] for c in robot.calls]
-    assert len(set(first_sweep)) == 1, (
-        f"a sweep must hold ONE direction for {SEARCH_SWEEP_TICKS} ticks, got {first_sweep}"
-    )
-    # Next tick must reverse, so the sweep covers the other side too.
-    policy.decide_and_act(FRAME, ENABLED_SENSORS, nothing, wall_unknown, hold_toggle=False)
-    assert robot.calls[-1][1] != first_sweep[0], (
-        f"after {SEARCH_SWEEP_TICKS} ticks it must reverse, got {robot.calls[-1][1]} again"
-    )
-    print(
-        f"  -> {SEARCH_SWEEP_TICKS}x {first_sweep[0]} "
-        f"({SEARCH_SWEEP_TICKS * TURN_MS}ms of continuous rotation), then reversed to {robot.calls[-1][1]}"
-    )
+    dirs = [c[1] for c in robot.calls]
+    if SEARCH_DIRECTION is not None:
+        assert set(dirs) == {SEARCH_DIRECTION}, (
+            f"search must keep turning {SEARCH_DIRECTION} without reversing, got {dirs}"
+        )
+        print(f"  -> {len(dirs)}x {SEARCH_DIRECTION} with no reversal ({len(dirs) * TURN_MS}ms of rotation)")
+    else:
+        first_block = dirs[:SEARCH_SWEEP_TICKS]
+        assert len(set(first_block)) == 1, f"a sweep must hold ONE direction, got {first_block}"
+        assert dirs[SEARCH_SWEEP_TICKS] != first_block[0], "must reverse after a full sweep"
+        print(f"  -> {SEARCH_SWEEP_TICKS}x {first_block[0]}, then reversed to {dirs[SEARCH_SWEEP_TICKS]}")
 
     print("[SELF-TEST] NEW: mid-sweep, the instant the ball appears it stops searching and chases")
     robot = _FakeRobot()
